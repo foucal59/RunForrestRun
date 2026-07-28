@@ -1,0 +1,52 @@
+node_modules/
+dist/
+.env*
+!.env.example
+.envrc
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+exports/
+screenshots/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vite/
+.DS_Store
+.vercel/
+.runtime/
+*.log
+
+# Secrets, certificats et archives locales
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+*.zip
+
+# Exports d'activites et donnees de localisation
+*.fit
+*.gpx
+*.tcx
+*.kml
+*.kmz
+*.geojson
+*.csv
+*.tsv
+*.jsonl
+
+# ── Donnees personnelles du coureur ──────────────────────────────────────────
+# Ces fichiers contiennent des donnees d'entrainement identifiantes (records,
+# frequence cardiaque, historique de runs, plan nominatif). Ils restent locaux :
+# ne les committez pas. Voir coach_profile.example.json pour le format.
+coach_profile.json
+public/coach-journal.json
+coach-journal*.json
+training-plan.md
+training_plan.json
+*-plan-*.pdf
+public/*.pdf

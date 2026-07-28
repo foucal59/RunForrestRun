@@ -1,0 +1,9 @@
+{
+  "_comment": "Copie ce fichier en coach_profile.json et renseigne tes valeurs. Ce fichier local est ignore par Git.",
+  "pr_5k": "",
+  "pr_10k": "",
+  "pr_marathon": "",
+  "objectif": "",
+  "fc_facile": 140,
+  "fc_max": 190
+}

@@ -1,0 +1,21 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/app"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/app.py": {
+      "maxDuration": 120,
+      "excludeFiles": "{tests/**,__pycache__/**,.venv/**,.runtime/**,node_modules/**,dist/**,_old/**,tmp/**,StravaDashboard.app/**}"
+    }
+  }
+}

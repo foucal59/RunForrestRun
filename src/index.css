@@ -1,0 +1,415 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Block horizontal overflow on mobile without creating a new scrolling
+     context (which would break vertical scroll on iOS Safari). `clip` is
+     widely supported (Safari 16+, Chrome 90+, Firefox 81+). */
+  body {
+    overflow-x: clip;
+    @apply bg-surface text-txt font-sans;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    overscroll-behavior-y: none;
+  }
+  /* Scrollable containers get momentum scrolling */
+  .overflow-y-auto, .overflow-x-auto, .overflow-auto {
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Hide scrollbars on mobile */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-surface-muted; }
+  ::-webkit-scrollbar-thumb { @apply bg-surface-border rounded-full; }
+  /* Native press effect on interactive elements */
+  button, a {
+    touch-action: manipulation;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-card border border-surface-border rounded-2xl p-5 shadow-card transition-all duration-200;
+  }
+  .card:hover { @apply shadow-card-hover; }
+  .stat-value { @apply text-3xl font-semibold tracking-tight text-txt font-mono; }
+  .stat-label { @apply text-xs uppercase tracking-wider text-txt-secondary mt-1; }
+  .nav-link { @apply px-4 py-2 text-sm font-medium text-txt-secondary hover:text-primary hover:bg-blue-50 transition-all duration-200 rounded-lg; }
+  .nav-link.active { @apply text-primary bg-blue-50 font-semibold; }
+  .badge { @apply inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium; }
+  .badge-brand { @apply bg-brand/10 text-brand; }
+  .badge-danger { @apply bg-red-50 text-red-600; }
+  .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+  .scrollbar-hide::-webkit-scrollbar { display: none; }
+  .safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0); }
+  .safe-top { padding-top: env(safe-area-inset-top, 0); }
+  .page_heading { @apply text-xl font-semibold; }
+  .card_header_row { @apply flex items-center justify-between; }
+  .card_header_row_compact { @apply flex items-center justify-between mb-3; }
+  .card_header_row_spaced { @apply flex items-center justify-between mb-4; }
+  .card_section_title { @apply text-sm font-medium text-txt-secondary; }
+  .card_section_title_compact { @apply text-sm font-medium text-txt-secondary mb-3; }
+  .card_link_text { @apply text-xs text-brand hover:underline; }
+  .metric_label_caps { @apply text-[10px] text-txt-muted uppercase tracking-wider; }
+  .metric_note_tiny { @apply text-[9px] text-txt-muted mt-0.5; }
+  .metric_note_tiny_warning { @apply text-[9px] text-amber-600 mt-0.5; }
+  .metric_value_text { @apply text-lg font-mono font-semibold text-txt; }
+  .metric_value_blue { @apply text-lg font-mono font-semibold text-blue-600; }
+  .metric_value_red { @apply text-lg font-mono font-semibold text-red-500; }
+  .metric_value_green { @apply text-lg font-mono font-semibold text-emerald-600; }
+  .tooltip_surface_card { @apply bg-white border border-surface-border rounded-xl px-4 py-3 shadow-lg; }
+  .tooltip_date_label { @apply text-xs text-txt-secondary font-medium; }
+  .tooltip_value_blue { @apply text-sm text-blue-600 font-mono; }
+  .tooltip_value_red { @apply text-sm text-red-500 font-mono; }
+  .tooltip_value_green { @apply text-sm text-emerald-600 font-mono; }
+  .tooltip_badge { @apply mt-1.5 px-2 py-0.5 rounded text-xs font-medium; }
+  .muted_caption_text { @apply text-xs text-txt-muted; }
+  .guide_marker_row { @apply flex items-center gap-2 mb-1; }
+  .guide_marker_label { @apply font-medium text-txt; }
+  .data_table_scroller { @apply overflow-x-auto; }
+  .data_table_header_row { @apply text-xs text-txt-muted uppercase tracking-wider border-b border-surface-border; }
+  .data_table_header_cell_left { @apply text-left py-2 pr-3; }
+  .data_table_header_cell_right { @apply text-right py-2 pr-3; }
+  .data_table_header_cell_right_last { @apply text-right py-2; }
+  .data_table_body_row { @apply border-b border-surface-border/50 hover:bg-surface-hover cursor-pointer transition-colors; }
+  .data_table_body_cell_date { @apply py-2.5 pr-3 text-txt-muted whitespace-nowrap; }
+  .data_table_body_cell_title { @apply py-2.5 pr-3 text-txt font-medium truncate max-w-[200px]; }
+  .data_table_body_cell_metric { @apply py-2.5 pr-3 text-right font-mono text-txt; }
+  .data_table_body_cell_metric_last { @apply py-2.5 text-right font-mono text-txt; }
+  .brand_logo { @apply inline-flex items-center min-w-0 leading-none; }
+  .brand_logo_mark { @apply h-8 w-8 flex-none rounded-lg shadow-sm; }
+  .brand_logo_compact .brand_logo_mark { @apply h-7 w-7; }
+  /* iOS-style press feedback */
+  .ios-press {
+    @apply transition-transform active:scale-95;
+    transition-duration: 100ms;
+  }
+}
+
+/* Recharts light theme */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line { stroke: #e2e8f0; stroke-opacity: 0.8; }
+.recharts-text { fill: #64748b; font-size: 11px; }
+.recharts-tooltip-cursor { stroke: #2563EB; stroke-opacity: 0.1; }
+.recharts-active-dot circle { filter: drop-shadow(0 0 3px currentColor); }
+
+/* Leaflet light popup */
+.light-popup .leaflet-popup-content-wrapper {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  color: #1e293b;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.07);
+}
+.light-popup .leaflet-popup-tip { background: #ffffff; }
+.light-popup .leaflet-popup-close-button { color: #94a3b8; }
+
+@keyframes slide-up {
+  from { transform: translateY(100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.animate-slide-up { animation: slide-up 0.25s ease-out; }
+
+/* ===== Nuage Allure vs Distance (façon Smashrun) ===== */
+@keyframes pace-dot-bloom {
+  from { transform: scale(0); }
+  to { transform: scale(1); }
+}
+.pace-dot {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: pace-dot-bloom 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  /* Les points glissent quand le filtre de dates change (le côté dynamique). */
+  transition: cx 0.6s cubic-bezier(0.22, 0.61, 0.36, 1),
+              cy 0.6s cubic-bezier(0.22, 0.61, 0.36, 1),
+              r 0.18s ease-out;
+}
+.pace_scatter_dot { fill: #2563eb; fill-opacity: 0.5; cursor: pointer; }
+.pace_scatter_avg { stroke: #2563eb; stroke-width: 2; }
+.pace_scatter_last { fill: #ffffff; stroke: #64748b; stroke-width: 1; cursor: pointer; }
+.pace_scatter_dot_comparison { fill: #e11d48; fill-opacity: 0.92; stroke: #ffffff; stroke-width: 1.25; }
+.pace_scatter_dot_selected { fill: #f59e0b; fill-opacity: 1; stroke: #ffffff; stroke-width: 2; }
+.pace_scatter_dot_hover { fill: #2563eb; fill-opacity: 0.95; stroke: #ffffff; stroke-width: 2; }
+.pace_scatter_selected_ring { fill: none; stroke: #f59e0b; stroke-width: 2; stroke-opacity: 0.9; }
+.pace_scatter_reference { stroke: #0f766e; stroke-width: 1.35; stroke-dasharray: 5 4; stroke-opacity: 0.82; }
+.pace_scatter_quadrant { fill: #10b981; fill-opacity: 0.08; }
+.pace_scatter_grid { stroke: #e2e8f0; stroke-opacity: 0.8; }
+.pace_scatter_axis_text { fill: #64748b; }
+.pace_distance_scatter_select { min-height: 2rem; }
+.pace_distance_scatter_zoom { min-height: 2rem; }
+.point_graph_zoom { min-height: 2rem; }
+.point_graph_dot_group circle {
+  transition: r 0.16s ease-out, fill 0.16s ease-out, fill-opacity 0.16s ease-out;
+}
+.point_graph_dot_group:hover circle:last-child {
+  filter: drop-shadow(0 0 3px rgb(37 99 235 / 0.35));
+}
+.point_graph_selected_ring {
+  fill: none;
+  stroke: #f59e0b;
+  stroke-width: 2;
+  stroke-opacity: 0.9;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .chart_card_root {
+    padding: 0.75rem;
+    border-radius: 0.75rem;
+    overflow: hidden;
+  }
+  .chart_card_header {
+    margin-bottom: 0.625rem;
+  }
+  .chart_card_title {
+    font-size: 0.8125rem;
+    line-height: 1.2;
+  }
+  .chart_card_subtitle {
+    font-size: 0.6875rem;
+    line-height: 1.25;
+  }
+  .chart_card_root > .recharts-responsive-container {
+    height: clamp(220px, 62vw, 260px) !important;
+  }
+  .chart_card_training_fitness_chart > .recharts-responsive-container,
+  .chart_card_progress_fitness_chart > .recharts-responsive-container {
+    height: clamp(250px, 72vw, 300px) !important;
+  }
+  .chart_card_root .recharts-text,
+  .chart_card_root .recharts-cartesian-axis-tick-value {
+    font-size: 10px;
+  }
+  .chart_card_root .recharts-yAxis .recharts-cartesian-axis-tick-value {
+    font-size: 9px;
+  }
+  .chart_theme_tooltip,
+  .tooltip_surface_card {
+    max-width: min(78vw, 260px);
+    padding: 0.625rem 0.75rem;
+    border-radius: 0.75rem;
+  }
+
+  .training_zones_distribution_layout,
+  .progress_zones_distribution_layout,
+  .activity_detail_hr_zones_inner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+  .training_zones_distribution_layout > .recharts-responsive-container,
+  .progress_zones_distribution_layout > .recharts-responsive-container,
+  .activity_detail_hr_zones_inner > .recharts-responsive-container {
+    width: 100% !important;
+    height: 190px !important;
+    min-height: 190px;
+  }
+  .training_zones_legend,
+  .progress_zones_legend,
+  .activity_detail_hr_zones_inner_list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem 0.75rem;
+  }
+  .training_zones_zone,
+  .progress_zones_zone,
+  .activity_detail_hr_zones_inner_list_section {
+    min-width: 0;
+    gap: 0.5rem;
+  }
+  .training_zones_zone_pct_value,
+  .progress_zones_zone_pct_value,
+  .activity_detail_hr_zones_inner_list_section_pct_value {
+    font-size: 0.75rem;
+  }
+
+  .cockpit_daily_training_card {
+    padding: 0.75rem;
+    border-radius: 0.75rem;
+  }
+  .cockpit_daily_training_header {
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+  .cockpit_daily_training_header_right {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.375rem 0.75rem;
+  }
+  .cockpit_daily_training_observations {
+    font-size: 0.875rem;
+    line-height: 1.35;
+    margin-bottom: 0.375rem;
+  }
+  .cockpit_daily_training_adjustment {
+    font-size: 0.8125rem;
+    line-height: 1.35;
+    margin-bottom: 0.75rem;
+  }
+  .cockpit_daily_training_day_title,
+  .cockpit_daily_training_step_text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .cockpit_daily_training_day_title {
+    -webkit-line-clamp: 1;
+  }
+  .cockpit_daily_training_step_text {
+    -webkit-line-clamp: 1;
+    font-size: 0.75rem;
+    line-height: 1.25;
+  }
+  .cockpit_daily_training_day {
+    padding: 0.625rem;
+  }
+  .cockpit_daily_training_day_steps {
+    row-gap: 0.25rem;
+  }
+  .cockpit_daily_training_step_label {
+    font-size: 0.625rem;
+    line-height: 1.1;
+  }
+  .cockpit_daily_training_hr {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+  }
+  .cockpit_daily_training_hr_title {
+    margin-bottom: 0.25rem;
+  }
+  .cockpit_daily_training_hr_item_note {
+    display: none;
+  }
+  .cockpit_daily_training_future_row {
+    min-height: 2.25rem;
+  }
+}
+
+@media (max-width: 380px) {
+  .training_zones_legend,
+  .progress_zones_legend,
+  .activity_detail_hr_zones_inner_list {
+    grid-template-columns: 1fr;
+  }
+}
+
+html.dark .pace_scatter_dot { fill: #4892f1; fill-opacity: 0.55; }
+html.dark .pace_scatter_avg { stroke: #93c5fd; }
+html.dark .pace_scatter_last { fill: #ffffff; stroke: #475569; }
+html.dark .pace_scatter_dot_comparison { fill: #fb7185; fill-opacity: 0.95; stroke: #0f172a; }
+html.dark .pace_scatter_dot_selected { fill: #fbbf24; fill-opacity: 1; stroke: #0f172a; }
+html.dark .pace_scatter_dot_hover { fill: #93c5fd; stroke: #0f172a; }
+html.dark .pace_scatter_selected_ring { stroke: #fbbf24; }
+html.dark .pace_scatter_reference { stroke: #5eead4; stroke-opacity: 0.82; }
+html.dark .pace_scatter_quadrant { fill: #34d399; fill-opacity: 0.1; }
+html.dark .pace_scatter_grid { stroke: #334155; }
+html.dark .pace_scatter_axis_text { fill: #94a3b8; }
+html.dark .pace_distance_scatter_select {
+  background-color: #0f172a;
+  border-color: #334155;
+  color: #cbd5e1;
+}
+html.dark .pace_distance_scatter_zoom {
+  background-color: #0f172a;
+  border-color: #334155;
+}
+html.dark .point_graph_zoom {
+  background-color: #0f172a;
+  border-color: #334155;
+}
+html.dark .point_graph_selected_ring {
+  stroke: #fbbf24;
+}
+
+/* ===== DARK MODE ===== */
+html.dark body {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+
+html.dark .card {
+  background-color: #1e293b;
+  border-color: #334155;
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.3);
+}
+html.dark .card:hover {
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.4);
+}
+
+html.dark header {
+  background-color: rgba(15, 23, 42, 0.9) !important;
+  border-color: #334155 !important;
+}
+
+/* Dark mode nav */
+html.dark .nav-link {
+  color: #94a3b8;
+}
+html.dark .nav-link:hover {
+  color: #93c5fd;
+  background-color: rgba(37, 99, 235, 0.1);
+}
+html.dark .nav-link.active {
+  color: #93c5fd;
+  background-color: rgba(37, 99, 235, 0.15);
+}
+
+/* Dark mode mobile bars */
+html.dark nav.fixed,
+html.dark header.sticky.lg\:hidden {
+  background-color: rgba(15, 23, 42, 0.88) !important;
+  border-color: #334155 !important;
+}
+html.dark .safe-top {
+  background-color: #0f172a !important;
+}
+
+/* Dark mode text utilities */
+html.dark .text-txt { color: #e2e8f0; }
+html.dark .text-txt-secondary { color: #94a3b8; }
+html.dark .text-txt-muted { color: #64748b; }
+
+/* Dark mode backgrounds */
+html.dark .bg-surface-muted,
+html.dark .bg-surface-hover { background-color: #1e293b; }
+html.dark .bg-white { background-color: #1e293b !important; }
+html.dark .bg-white\/95 { background-color: rgba(30, 41, 59, 0.95) !important; }
+html.dark .bg-white\/80 { background-color: rgba(30, 41, 59, 0.8) !important; }
+html.dark .border-surface-border { border-color: #334155; }
+html.dark .bg-surface-card { background-color: #1e293b; }
+
+/* Dark mode inputs */
+html.dark input {
+  background-color: #334155;
+  color: #e2e8f0;
+  border-color: #475569;
+}
+
+/* Dark mode recharts */
+html.dark .recharts-cartesian-grid-horizontal line,
+html.dark .recharts-cartesian-grid-vertical line { stroke: #334155; }
+html.dark .recharts-text { fill: #94a3b8; }
+
+/* Dark mode stat cards */
+html.dark .bg-surface-muted { background-color: #1e293b; }
+
+/* Dark mode Leaflet popup */
+html.dark .light-popup .leaflet-popup-content-wrapper {
+  background: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+html.dark .light-popup .leaflet-popup-tip { background: #1e293b; }
+
+/* Dark mode footer */
+html.dark footer {
+  border-color: #334155;
+}
+
+/* Dark mode date range filter & misc surfaces */
+html.dark .bg-amber-50 { background-color: rgba(92, 60, 0, 0.3) !important; }
+html.dark .border-amber-200 { border-color: #92400e !important; }
+html.dark .text-amber-800 { color: #fcd34d !important; }
+html.dark .text-amber-700 { color: #fbbf24 !important; }
+html.dark .text-amber-600 { color: #f59e0b !important; }
+html.dark .hover\:bg-surface-hover:hover { background-color: #293548 !important; }

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#111827" />
+  <link rel="icon" type="image/svg+xml" href="/favicon-bw-v3.svg" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Garmin Running Dashboard" />
+  <link rel="manifest" href="/manifest.json?v=garmin-running-dashboard-v1" />
+  <title>Garmin Running Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* Splash instantané : peint pendant le téléchargement du JS/CSS et le
+       réveil de la base, pour supprimer l'écran blanc au démarrage. React
+       remplace le contenu de #root dès qu'il monte, ce qui l'efface. */
+    #app-splash{position:fixed;inset:0;display:flex;flex-direction:column;
+      align-items:center;justify-content:center;gap:22px;
+      background:#F8FAFC;color:#1E293B;
+      font-family:'Outfit',system-ui,-apple-system,sans-serif}
+    @media (prefers-color-scheme: dark){
+      #app-splash{background:#0F172A;color:#F1F5F9}
+    }
+    #app-splash .s-logo{font-size:22px;font-weight:700;letter-spacing:-0.02em;opacity:.92}
+    #app-splash .s-spin{width:30px;height:30px;border-radius:50%;
+      border:3px solid rgba(99,102,241,.25);border-top-color:#6366F1;
+      animation:s-spin .8s linear infinite}
+    @keyframes s-spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body class="bg-surface text-txt antialiased">
+  <div id="root">
+    <div id="app-splash">
+      <div class="s-logo">Garmin Running Dashboard</div>
+      <div class="s-spin"></div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>

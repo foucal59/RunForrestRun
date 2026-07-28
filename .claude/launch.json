@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Backend",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "Frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+      "port": 5173
+    }
+  ]
+}

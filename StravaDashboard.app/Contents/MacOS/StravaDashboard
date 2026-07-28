@@ -1,0 +1,18 @@
+#!/bin/bash
+# macOS .app entry point. Launches the shared start script and exits.
+# Double-clicking this bundle does NOT open a Terminal window — macOS
+# executes this script directly, so when it exits there is nothing left
+# running in the foreground and nothing blocks the Mac from sleeping
+# or shutting down.
+set -u
+
+SELF="$(cd "$(dirname "$0")" && pwd)"
+# Garmin Running Dashboard app entry point -> project root is ../../../
+PROJECT_DIR="$(cd "$SELF/../../.." && pwd)"
+
+# Redirect anything the shell itself prints so we never block on stdio.
+exec >>"$PROJECT_DIR/.runtime/launch.log" 2>&1
+mkdir -p "$PROJECT_DIR/.runtime"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Garmin Running Dashboard app invoked"
+bash "$PROJECT_DIR/scripts/start.sh"
