@@ -8,7 +8,7 @@ planifiable, synchronisee sans fil sur la montre).
 
 Ce module :
   1. parse le texte d'une seance (« 3 x 8' recup 2' trot », « 18 km dont les 6
-     derniers a 5:30 », etc.) en une liste de steps ;
+     derniers a 4:37 », etc.) en une liste de steps ;
   2. rend le JSON attendu par le workout-service (dict pret pour upload_workout).
 
 Reserve aux SL et seances qualite (seuil, VO2, allure marathon, tempo). Les
@@ -23,8 +23,8 @@ from typing import Any
 
 
 # Allures par defaut (sec/km) quand le texte n'en donne pas.
-_DEFAULT_EASY_SEC = 390  # ~6:30/km
-_DEFAULT_RECOVERY_SEC = 410  # ~6:50/km
+_DEFAULT_EASY_SEC = 335  # ~5:35/km
+_DEFAULT_RECOVERY_SEC = 350  # ~5:50/km
 
 # ── Identifiants Garmin (workout-service) ───────────────────────────────────
 _SPORT_RUNNING = {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
@@ -182,12 +182,12 @@ def _build_long_steps(main: str) -> list[Any]:
     total_km = (low + high) / 2
 
     # Bloc allure marathon en fin de sortie. Formes : "dont les 6 derniers a
-    # 5:25-5:35", "dont 10-12 km a ...", "dont 2 x 6 km a ...".
+    # 4:35-4:40", "dont 10-12 km a ...", "dont 2 x 6 km a ...".
     am_pace = None
     am_km = None
     tail = main.split("dont", 1)[1] if "dont" in main else ""
-    if tail and (_parse_pace_range(tail) or re.search(r"allure marathon|\bAM\b", tail)):
-        am_pace = _parse_pace_range(tail) or (335, 330)  # ~5:35-5:30
+    if tail and re.search(r"4:3[57]|allure marathon|\bAM\b", tail):
+        am_pace = _parse_pace_range(tail) or (280, 277)  # ~4:40-4:37
         rep = re.search(r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*km", tail)
         last = re.search(r"les?\s+(\d+)(?:\s*-\s*(\d+))?\s*derniers?", tail)
         simple = re.search(r"(\d+)(?:\s*-\s*(\d+))?\s*km", tail)
@@ -200,7 +200,7 @@ def _build_long_steps(main: str) -> list[Any]:
             a, b = int(simple.group(1)), int(simple.group(2) or simple.group(1))
             am_km = (a + b) / 2
 
-    easy_pace = (405, 375)  # 6:45-6:15
+    easy_pace = (_DEFAULT_EASY_SEC, 320)  # 5:35-5:20
     if am_km and 0 < am_km < total_km:
         if rep:
             steps.extend(_split_repeated_long_blocks(

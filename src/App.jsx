@@ -34,6 +34,72 @@ function RouteFallback() {
   )
 }
 
+const CHUNK_ERROR_RE = /dynamically imported module|Importing a module script failed|Failed to fetch|ChunkLoadError|error loading dynamically/i
+const CHUNK_RELOAD_KEY = 'rfr_chunk_reload'
+
+/**
+ * Un chunk de page peut devenir introuvable (deploiement pendant la session,
+ * cache navigateur/SW pointant sur un ancien build). Sans filet, l'import
+ * dynamique jette dans le Suspense et l'ecran devient blanc — typiquement
+ * "Plan detaille ne s'ouvre pas" sur un mobile qui garde un cache ancien.
+ * On purge alors les caches et on recharge une seule fois par session.
+ */
+class ChunkErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { failed: false }
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  componentDidCatch(error) {
+    const message = String(error?.message || error)
+    const isChunkError = CHUNK_ERROR_RE.test(message)
+    console.error('[App] route render failed:', message, 'chunkError=', isChunkError)
+    if (!isChunkError) return
+    if (sessionStorage.getItem(CHUNK_RELOAD_KEY)) {
+      console.warn('[App] chunk error persists after reload — leaving the retry screen up')
+      return
+    }
+    sessionStorage.setItem(CHUNK_RELOAD_KEY, '1')
+    this.purgeAndReload()
+  }
+
+  async purgeAndReload() {
+    try {
+      if ('caches' in window) {
+        const keys = await caches.keys()
+        await Promise.all(keys.map(k => caches.delete(k)))
+        console.log('[App] purged', keys.length, 'cache(s) after chunk error')
+      }
+    } catch (e) {
+      console.warn('[App] cache purge failed:', e)
+    }
+    window.location.reload()
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children
+    return (
+      <div className="py-20 text-center chunk_error_state" data-name="chunk_error_state">
+        <div className="text-txt mb-2">Cette page n'a pas pu être chargée.</div>
+        <div className="text-sm text-txt-muted mb-4">
+          Le cache de l'application était périmé. Recharge la page pour récupérer la dernière version.
+        </div>
+        <button
+          onClick={() => { sessionStorage.removeItem(CHUNK_RELOAD_KEY); this.purgeAndReload() }}
+          className="px-4 py-2 rounded-lg bg-brand text-white text-sm chunk_error_retry"
+          data-name="chunk_error_retry"
+        >
+          Recharger
+        </button>
+      </div>
+    )
+  }
+}
+
 function canUseLocalSessionRestore() {
   return LOCAL_SESSION_HOSTS.has(window.location.hostname)
 }
@@ -331,24 +397,26 @@ function DashboardGate({ athlete, onLogout }) {
   const runOpen = searchParams.has('run')
   return (
     <Layout athlete={athlete} onLogout={onLogout}>
-      <Suspense fallback={<RouteFallback />}>
-        <Routes>
-          <Route path="/" element={<Cockpit />} />
-          <Route path="/runs" element={<Runs />} />
-          <Route path="/volume" element={<Volume />} />
-          <Route path="/performance" element={<Performance />} />
-          <Route path="/analysis" element={<Navigate to="/progress" replace />} />
-          <Route path="/training" element={<Training />} />
-          <Route path="/plan" element={<PlanDetails />} />
-          <Route path="/training-zones" element={<TrainingZones />} />
-          <Route path="/activity/:id" element={<ActivityDetail />} />
-          <Route path="/progress" element={<Progress />} />
-          <Route path="/gear" element={<Gear />} />
-          <Route path="/analyse" element={<Navigate to="/progress" replace />} />
-          <Route path="/records" element={<Records />} />
-          <Route path="/vo2max" element={<Navigate to="/progress" replace />} />
-        </Routes>
-      </Suspense>
+      <ChunkErrorBoundary>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+            <Route path="/" element={<Cockpit />} />
+            <Route path="/runs" element={<Runs />} />
+            <Route path="/volume" element={<Volume />} />
+            <Route path="/performance" element={<Performance />} />
+            <Route path="/analysis" element={<Navigate to="/progress" replace />} />
+            <Route path="/training" element={<Training />} />
+            <Route path="/plan" element={<PlanDetails />} />
+            <Route path="/training-zones" element={<TrainingZones />} />
+            <Route path="/activity/:id" element={<ActivityDetail />} />
+            <Route path="/progress" element={<Progress />} />
+            <Route path="/gear" element={<Gear />} />
+            <Route path="/analyse" element={<Navigate to="/progress" replace />} />
+            <Route path="/records" element={<Records />} />
+            <Route path="/vo2max" element={<Navigate to="/progress" replace />} />
+          </Routes>
+        </Suspense>
+      </ChunkErrorBoundary>
       {runOpen && (
         <Suspense fallback={null}>
           <RunModal />

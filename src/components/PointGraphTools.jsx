@@ -186,7 +186,7 @@ export function pointDot({
   radius = 2.5,
 }) {
   return function PointDot(props) {
-    const { cx, cy, payload, index, value } = props
+    const { cx, cy, payload, index, value, key } = props
     if (!isFiniteNumber(cx) || !isFiniteNumber(cy) || value == null) return null
     const id = getId(payload, index)
     const selected = id && selectedId === id
@@ -194,6 +194,7 @@ export function pointDot({
 
     return (
       <g
+        key={key}
         className="point_graph_dot_group"
         data-name="point_graph_dot"
         onClick={() => onSelect(payload, index)}
@@ -223,7 +224,7 @@ export function scatterPoint({
   radius = 4,
 }) {
   return function ScatterPoint(props) {
-    const { cx, cy, payload, index } = props
+    const { cx, cy, payload, index, key } = props
     if (!isFiniteNumber(cx) || !isFiniteNumber(cy)) return null
     const id = getId(payload, index)
     const selected = id && selectedId === id
@@ -231,6 +232,7 @@ export function scatterPoint({
 
     return (
       <g
+        key={key}
         className="point_graph_dot_group"
         data-name="point_graph_scatter_dot"
         onClick={() => onSelect(payload, index)}

@@ -5,10 +5,14 @@
  * top up the delta on open (see `checkFreshness`). All other calls are DB reads.
  */
 
-const SHOES_CACHE_STORAGE = 'garmin-shoes-v2'
-const DAILY_PLAN_SOURCE = 'marathon-template'
-const DAILY_PLAN_DESCRIPTION = 'Coach Marathon (modèle de 16 semaines à personnaliser)'
+const SHOES_CACHE_KEY = 'garmin_shoes_v2'
+// Chemin de repli : quand l'API est injoignable, le plan est relu dans le
+// snapshot coach public. L'identite du plan (course, objectif) vient donc du
+// snapshot, jamais d'une constante ecrite ici — une course codee en dur dans le
+// frontend contredirait le profil du coureur des qu'il en change.
+const DAILY_PLAN_SOURCE = 'snapshot-coach'
 const DAILY_PLAN_BASIS = 'Adapte sur les 10 derniers entrainements charges'
+const DAILY_PLAN_FALLBACK_DESCRIPTION = "Plan d'entrainement"
 
 // ── Helpers ──
 
@@ -194,7 +198,7 @@ export async function loadRunWeather(activity) {
 // ── Public: Cache management ──
 
 export function clearTokens() {
-  localStorage.removeItem(SHOES_CACHE_STORAGE)
+  localStorage.removeItem(SHOES_CACHE_KEY)
 }
 
 export function clearAllCache() {
@@ -208,7 +212,7 @@ export function clearAllCache() {
 
 export function getCachedShoes() {
   try {
-    const raw = localStorage.getItem(SHOES_CACHE_STORAGE)
+    const raw = localStorage.getItem(SHOES_CACHE_KEY)
     return raw ? JSON.parse(raw) : []
   } catch { return [] }
 }
@@ -217,9 +221,9 @@ export async function fetchShoes() {
   try {
     const data = await fetchAPI('/api/data/shoes')
     const shoes = data?.shoes || []
-    // one-shot migration from the legacy storage name
+    // one-shot migration: strava_shoes_v2 → garmin_shoes_v2
     localStorage.removeItem('strava_shoes_v2')
-    localStorage.setItem(SHOES_CACHE_STORAGE, JSON.stringify(shoes))
+    localStorage.setItem(SHOES_CACHE_KEY, JSON.stringify(shoes))
     return shoes
   } catch { return [] }
 }
@@ -431,6 +435,9 @@ function coachSessionTitle(text) {
 
 function coachSnapshotToDailyTraining(snapshot, requestedDay) {
   if (!snapshot) return null
+  // L'objectif est ecrit par le generateur du snapshot depuis le profil du
+  // coureur : c'est lui qui nomme la course et le chrono cible.
+  const planDescription = String(snapshot.objectif || '').trim() || DAILY_PLAN_FALLBACK_DESCRIPTION
   const targetDay = requestedDay || snapshot.seance_du_jour?.date || snapshot.genere_le
   const rawItems = [
     snapshot.seance_du_jour,
@@ -452,7 +459,7 @@ function coachSnapshotToDailyTraining(snapshot, requestedDay) {
       dateLabel: formatCoachDateLabel(date),
       relativeLabel: offset === 0 ? "Aujourd'hui" : `J+${offset}`,
       planSource: DAILY_PLAN_SOURCE,
-      planDescription: DAILY_PLAN_DESCRIPTION,
+      planDescription,
       planBasis: DAILY_PLAN_BASIS,
       status: 'scheduled',
       statusLabel: 'A faire',
@@ -470,7 +477,7 @@ function coachSnapshotToDailyTraining(snapshot, requestedDay) {
         dateLabel: formatCoachDateLabel(item.date),
         relativeLabel: index === 0 ? "Aujourd'hui" : `J+${index}`,
         planSource: DAILY_PLAN_SOURCE,
-        planDescription: DAILY_PLAN_DESCRIPTION,
+        planDescription,
         planBasis: DAILY_PLAN_BASIS,
         status: 'scheduled',
         statusLabel: 'A faire',
@@ -489,7 +496,7 @@ function coachSnapshotToDailyTraining(snapshot, requestedDay) {
   return {
     ...current,
     planSource: DAILY_PLAN_SOURCE,
-    planDescription: DAILY_PLAN_DESCRIPTION,
+    planDescription,
     planBasis: DAILY_PLAN_BASIS,
     planPeriod: null,
     dataThrough: latestRun?.date || snapshot.genere_le || '',
@@ -514,19 +521,28 @@ async function loadDailyTrainingFromCoachSnapshot(day) {
 }
 
 async function loadCoachSnapshot() {
-  return fetchAPI('/api/coach/journal', {}, { retries: 2 })
+  let lastError
+  for (const path of ['/api/coach/journal', '/coach-journal.json']) {
+    try {
+      return await fetchAPI(path, {}, { retries: path.startsWith('/api/') ? 2 : 0 })
+    } catch (e) {
+      lastError = e
+    }
+  }
+  throw lastError || new Error('coach snapshot unavailable')
 }
 
 /**
- * On-open freshness probe: asks the backend to pull any runs from Garmin
- * that are newer than the latest one in Neon. Returns `{ added, details_fetched, ... }`.
+ * Pull runs from Garmin. An explicit button click also asks the backend to
+ * converge every configured run database before returning.
  * Fails soft — returns null on any error, callers should keep rendering.
  */
-export async function checkFreshness() {
-  console.log('[API] Checking Garmin for newer activities…')
+export async function checkFreshness({ allDatabases = false } = {}) {
+  const path = allDatabases ? '/api/data/sync' : '/api/data/freshness-check'
+  console.log(`[API] Checking Garmin for newer activities${allDatabases ? ' + all databases' : ''}…`)
   try {
-    const data = await fetchAPI('/api/data/freshness-check', { method: 'POST' })
-    console.log(`[API] freshness result: added=${data?.added ?? '?'} skipped=${data?.skipped || 'none'} checked=${data?.checked}`)
+    const data = await fetchAPI(path, { method: 'POST' })
+    console.log(`[API] freshness result: added=${data?.added ?? '?'} skipped=${data?.skipped || 'none'} checked=${data?.checked} databases=${data?.database_sync?.mode || 'primary-only'}`)
     return data
   } catch (e) {
     console.warn('[API] freshness check failed:', e?.message || e)

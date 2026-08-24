@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Incrementally converge Neon and local PostgreSQL without full-table copies.
 
-Only runs whose `sync_status` is not `ok` participate. For those pending runs,
-the sync exchanges lightweight manifests and child-row counts. Raw rows move
-only when an activity is missing or one side has fewer laps, splits, best
-efforts, or stream points.
+Runs whose `sync_status` is not `ok` participate au pipeline détaillé : échange
+de manifests, composants et nombres de laps/splits/efforts/streams. Les
+activités hors course utilisent un chemin léger qui copie seulement les lignes
+absentes d'une base, sans les faire entrer dans l'enrichissement running.
 
 Once both databases have the run, matching child counts, and
 `details_fetched_at`, both rows receive `sync_complete_at`. Complete runs then
@@ -120,10 +120,18 @@ SMALL_TABLES = {
     "shoes": "id",
     "bikes": "id",
     "sync_meta": "key",
+    # Ajustements du coach : doivent suivre les deux bases, sinon un ajustement
+    # ecrit en prod disparait du dev local (et inversement).
+    "plan_overrides": "day",
 }
 
+# Schema introspection is immutable for the duration of one convergence. Keep
+# it per connection: without this cache every component of every pending run
+# performs two remote information_schema queries, which dominates sync time.
+_COLUMN_INFO_CACHE: dict[tuple[int, str], list[tuple[str, str]]] = {}
 
-def _parse_db_url(url: str) -> dict:
+
+def _parse_db_url(url: str, connection_timeout: int | None = None) -> dict:
     parsed = urlparse(url)
     params: dict = {
         "host": parsed.hostname,
@@ -131,7 +139,11 @@ def _parse_db_url(url: str) -> dict:
         "database": parsed.path.lstrip("/"),
         "user": parsed.username,
         "password": parsed.password,
-        "timeout": int(os.environ.get("SYNC_DB_TIMEOUT", "120")),
+        "timeout": (
+            connection_timeout
+            if connection_timeout is not None
+            else int(os.environ.get("SYNC_DB_TIMEOUT", "120"))
+        ),
     }
     qs = parse_qs(parsed.query)
     if qs.get("sslmode", [""])[0] in ("require", "verify-ca", "verify-full"):
@@ -142,9 +154,9 @@ def _parse_db_url(url: str) -> dict:
     return params
 
 
-def _connect(url: str, label: str):
+def _connect(url: str, label: str, connection_timeout: int | None = None):
     print(f"[incremental-sync] connecting to {label} ({urlparse(url).hostname})", file=sys.stderr)
-    return pg8000.dbapi.connect(**_parse_db_url(url))
+    return pg8000.dbapi.connect(**_parse_db_url(url, connection_timeout))
 
 
 def _table_exists(conn, table: str) -> bool:
@@ -232,6 +244,42 @@ def _pending_activity_ids(conn) -> set[int]:
     return {int(row[0]) for row in cur.fetchall()}
 
 
+def _cross_training_manifest(conn) -> dict[int, None]:
+    """Identifiants hors course pour convergence légère des lignes manquantes.
+
+    Elles n'ont ni laps ni détails de course à réconcilier : une copie de la
+    ligne absente suffit. On ne compare pas `updated_at` : l'upsert historique
+    lui passe une heure naïve, interprétée en Europe/Paris par la base locale et
+    en UTC par Neon. La comparer désignerait donc systématiquement un faux
+    « plus récent » alors que les données sont identiques.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id
+        FROM activities
+        WHERE type <> 'Run'
+    """)
+    return {int(row[0]): None for row in cur.fetchall()}
+
+
+def _sync_cross_training_activities(neon, local, dry_run: bool) -> int:
+    """Converge les lignes hors course manquantes dans l'une des deux bases."""
+    copied = 0
+    neon_state = _cross_training_manifest(neon)
+    local_state = _cross_training_manifest(local)
+    for source, destination, activity_id in _plan_small_table_actions(
+        neon_state, local_state
+    ):
+        src, dst = (neon, local) if source == "neon" else (local, neon)
+        print(
+            f"[incremental-sync] cross-training[{activity_id}]: "
+            f"{source} -> {destination}",
+            file=sys.stderr,
+        )
+        copied += _copy_activity(src, dst, activity_id, dry_run)
+    return copied
+
+
 def _activity_manifest(conn, activity_ids: set[int]) -> dict[int, dict]:
     if not activity_ids:
         return {}
@@ -313,6 +361,10 @@ def _child_manifest(conn, table: str, activity_ids: set[int]) -> dict[int, dict]
 
 
 def _column_info(conn, table: str) -> list[tuple[str, str]]:
+    cache_key = (id(conn), table)
+    cached = _COLUMN_INFO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     cur = conn.cursor()
     cur.execute("""
         SELECT column_name, data_type
@@ -320,7 +372,9 @@ def _column_info(conn, table: str) -> list[tuple[str, str]]:
         WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position
     """, [table])
-    return [(row[0], row[1]) for row in cur.fetchall()]
+    columns = [(row[0], row[1]) for row in cur.fetchall()]
+    _COLUMN_INFO_CACHE[cache_key] = columns
+    return columns
 
 
 def _common_columns(src, dst, table: str) -> list[tuple[str, str]]:
@@ -346,6 +400,27 @@ def _coerce_row(row: tuple, columns: list[tuple[str, str]]) -> tuple:
             value = json.dumps(value, ensure_ascii=False)
         values.append(value)
     return tuple(values)
+
+
+def _insert_rows_in_batches(
+    cur,
+    insert_prefix: str,
+    placeholders: str,
+    rows: list[tuple],
+    chunk_size: int = 500,
+) -> None:
+    """Insert many rows with one round-trip per chunk.
+
+    pg8000's executemany sends one statement per row. That made a manual sync
+    of stream-rich runs exceed Vercel's request window even though the payload
+    itself was modest. Multi-value inserts keep the exact same transaction and
+    JSON casts while reducing hundreds of round-trips to a handful.
+    """
+    for offset in range(0, len(rows), chunk_size):
+        batch = rows[offset:offset + chunk_size]
+        values_sql = ", ".join([f"({placeholders})"] * len(batch))
+        params = [value for row in batch for value in row]
+        cur.execute(f"{insert_prefix} VALUES {values_sql}", params)
 
 
 def _copy_activity(src, dst, activity_id: int, dry_run: bool) -> int:
@@ -434,8 +509,13 @@ def _replace_child_rows(
             "CAST(%s AS JSONB)" if data_type in ("json", "jsonb") else "%s"
             for _, data_type in columns
         )
-        insert_sql = f'INSERT INTO public."{table}" ({cols_sql}) VALUES ({placeholders})'
-        dst_cur.executemany(insert_sql, [_coerce_row(row, columns) for row in rows])
+        insert_prefix = f'INSERT INTO public."{table}" ({cols_sql})'
+        _insert_rows_in_batches(
+            dst_cur,
+            insert_prefix,
+            placeholders,
+            [_coerce_row(row, columns) for row in rows],
+        )
     dst.commit()
     return len(rows)
 
@@ -660,11 +740,26 @@ def _mark_sync_complete(conn, activity_ids: list[int], dry_run: bool) -> int:
     return cur.rowcount or 0
 
 
-def main() -> int:
-    dry_run = "--dry-run" in sys.argv[1:]
-    prepare_only = "--prepare-only" in sys.argv[1:]
-    neon_url = os.environ.get("DATABASE_URL_NEON") or os.environ.get("DATABASE_URL")
-    local_url = os.environ.get("LOCAL_DATABASE_URL")
+def main(
+    *,
+    neon_url: str | None = None,
+    local_url: str | None = None,
+    dry_run: bool | None = None,
+    prepare_only: bool | None = None,
+    connection_timeout: int | None = None,
+) -> int:
+    """Converge runs, cross-training rows and small tables across both stores.
+
+    Optional arguments make the same implementation reusable by the local and
+    Vercel API endpoints when the user explicitly clicks the sync button. The
+    command-line behaviour remains unchanged for start.sh and maintenance jobs.
+    """
+    if dry_run is None:
+        dry_run = "--dry-run" in sys.argv[1:]
+    if prepare_only is None:
+        prepare_only = "--prepare-only" in sys.argv[1:]
+    neon_url = neon_url or os.environ.get("DATABASE_URL_NEON") or os.environ.get("DATABASE_URL")
+    local_url = local_url or os.environ.get("LOCAL_DATABASE_URL")
     if not neon_url or not local_url:
         print("[incremental-sync] DATABASE_URL_NEON and LOCAL_DATABASE_URL are required", file=sys.stderr)
         return 1
@@ -672,10 +767,22 @@ def main() -> int:
         print("[incremental-sync] Neon and local URLs are identical; nothing to do", file=sys.stderr)
         return 0
 
+    _COLUMN_INFO_CACHE.clear()
     started = time.time()
-    neon = _connect(neon_url, "Neon")
-    local = _connect(local_url, "local")
+    neon = None
+    local = None
+    lock_acquired = False
     try:
+        neon = _connect(neon_url, "Neon", connection_timeout)
+        local = _connect(local_url, "local", connection_timeout)
+        # Every runtime (local server, Vercel, start.sh) takes the same lock on
+        # Neon. This prevents two button clicks from replacing child rows at
+        # the same time while still allowing the second caller to wait for the
+        # first convergence and observe its completed result.
+        lock_cur = neon.cursor()
+        lock_cur.execute("SELECT pg_advisory_lock(hashtext('rfr_neon_local_sync'))")
+        lock_acquired = True
+        print("[incremental-sync] cross-runtime lock acquired", file=sys.stderr)
         _ensure_support(neon, "Neon", dry_run)
         _ensure_support(local, "local", dry_run)
         if prepare_only:
@@ -683,6 +790,9 @@ def main() -> int:
             return 0
         tombstone_actions = _sync_tombstones(neon, local, dry_run)
         small_table_actions = _sync_small_tables(neon, local, dry_run)
+        cross_training_actions = _sync_cross_training_activities(
+            neon, local, dry_run
+        )
 
         pending_ids = _pending_activity_ids(neon) | _pending_activity_ids(local)
         neon_manifest = _activity_manifest(neon, pending_ids)
@@ -694,7 +804,7 @@ def main() -> int:
             table: _child_manifest(local, table, pending_ids) for table in CHILD_TABLES
         }
 
-        copied_activities = 0
+        copied_activities = cross_training_actions
         copied_components = 0
         copied_rows = 0
         actions = 0
@@ -839,18 +949,32 @@ def main() -> int:
             f"[incremental-sync] {mode}: pending={len(pending_ids)}, actions={actions}, "
             f"activities={copied_activities}, components={copied_components}, "
             f"child_rows={copied_rows}, "
-            f"small_rows={small_table_actions}, marked_ok={marked_ok}, "
+            f"small_rows={small_table_actions}, "
+            f"cross_training={cross_training_actions}, marked_ok={marked_ok}, "
             f"tombstones={tombstone_actions}, elapsed={elapsed:.1f}s",
             file=sys.stderr,
         )
         return 0
     finally:
+        if lock_acquired and neon is not None:
+            try:
+                unlock_cur = neon.cursor()
+                unlock_cur.execute(
+                    "SELECT pg_advisory_unlock(hashtext('rfr_neon_local_sync'))"
+                )
+            except Exception as exc:
+                print(
+                    f"[incremental-sync] advisory unlock failed: {exc}",
+                    file=sys.stderr,
+                )
         try:
-            neon.close()
+            if neon is not None:
+                neon.close()
         except Exception:
             pass
         try:
-            local.close()
+            if local is not None:
+                local.close()
         except Exception:
             pass
 

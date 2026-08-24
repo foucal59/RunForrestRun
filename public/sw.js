@@ -7,7 +7,10 @@
  *   - Auth/sync/streams: always network, never cache
  */
 
-const CACHE_VERSION = 'v8'
+// v9 : purge des caches v8, qui pouvaient contenir du HTML stocke sous une URL
+// de chunk JS (voir isHtmlResponse plus bas) — un appareil empoisonne restait
+// bloque sur /plan tant que son cache n'etait pas vide.
+const CACHE_VERSION = 'v9'
 const STATIC_CACHE = `static-${CACHE_VERSION}`
 const DATA_CACHE = `data-${CACHE_VERSION}`
 
@@ -20,6 +23,11 @@ const DATA_PREFIXES = ['/api/data/activities', '/api/data/prs', '/api/data/photo
 
 // Routes to never cache (auth tokens, live sync, streams)
 const SKIP_CACHE_PREFIXES = ['/api/auth', '/api/data/sync', '/api/streams', '/api/health']
+
+/** Une reponse HTML servie pour un asset = fallback SPA, jamais du vrai asset. */
+function isHtmlResponse(response) {
+  return (response?.headers?.get('content-type') || '').includes('text/html')
+}
 
 self.addEventListener('install', () => {
   console.log('[SW] Installed', CACHE_VERSION, 'dev=', IS_DEV_ORIGIN)
@@ -98,10 +106,21 @@ self.addEventListener('fetch', event => {
   // Cache-first for static assets (JS/CSS/fonts have hashed names → auto-invalidate)
   event.respondWith(
     caches.match(request).then(cached => {
+      // Un chunk absent (deploiement en cours, build precedent) est reecrit par
+      // Vercel en /index.html avec un 200 : sans ce garde-fou on cache du HTML
+      // sous une URL .js, et l'import dynamique de la page casse *definitivement*
+      // sur cet appareil.
+      if (cached && isHtmlResponse(cached)) {
+        console.warn('[SW] Poisoned cache entry (HTML) for', url.pathname, '— dropping')
+        caches.open(STATIC_CACHE).then(c => c.delete(request))
+        cached = null
+      }
       const networkFetch = fetch(request).then(res => {
-        if (res.ok) {
+        if (res.ok && !isHtmlResponse(res)) {
           const clone = res.clone()  // clone synchronously before res body is consumed
           caches.open(STATIC_CACHE).then(c => c.put(request, clone))
+        } else if (res.ok) {
+          console.warn('[SW] Not caching HTML served for', url.pathname)
         }
         return res
       })

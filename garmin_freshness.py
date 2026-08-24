@@ -38,6 +38,50 @@ RUNNING_TYPE_KEYS = {
     "virtual_run",
 }
 
+# La base est un miroir fidèle de Garmin : randos, vélos, ski… sont stockés au
+# même titre que les runs. Le site, les records, le volume et le plan ne lisent
+# que `type = 'Run'` (cf. database_pg), donc rien de tout ceci ne les pollue —
+# mais le coach nocturne y voit enfin la charge réelle (D+, temps sur pieds).
+#
+# `type`/`sport_type` = catégorie grossière façon Strava ; le typeKey Garmin brut
+# part dans la colonne `garmin_type_key`. Le matching se fait par sous-chaîne,
+# dans l'ordre : Garmin ajoute des types au fil du temps (`rowing_v2`,
+# `resort_skiing_snowboarding_ws`…) et une table exhaustive serait périmée à la
+# première nouveauté.
+_ACTIVITY_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Hike", ("hiking", "mountaineering")),
+    ("Walk", ("walking",)),
+    ("Ride", ("cycling", "biking", "e_bike", "handcycling")),
+    ("Swim", ("swimming", "diving", "snorkeling")),
+    ("Ski", ("skiing", "snowboard", "skating_ws", "snowshoe")),
+    ("Rowing", ("rowing", "kayaking", "paddleboarding", "surfing", "sailing")),
+    ("RockClimbing", ("climbing", "bouldering")),
+    ("WeightTraining", ("strength_training", "weight")),
+    ("Workout", (
+        "hiit", "cardio", "pilates", "yoga", "breathwork", "fitness_equipment",
+        "elliptical", "stair_climbing", "training",
+    )),
+)
+
+_DEFAULT_ACTIVITY_CATEGORY = "Other"
+
+
+def activity_category(type_key: str) -> str:
+    """Coarse `type`/`sport_type` for a Garmin typeKey.
+
+    'Run' reste réservé aux clés listées dans RUNNING_TYPE_KEYS, en correspondance
+    exacte : c'est ce filtre qui protège records, volume hebdo et plan. Une clé
+    running inconnue de Garmin retombera donc en 'Other' (visible, mais hors
+    statistiques) plutôt que d'entrer en douce dans les chronos.
+    """
+    key = (type_key or "").lower()
+    if key in RUNNING_TYPE_KEYS:
+        return "Run"
+    for category, needles in _ACTIVITY_CATEGORY_RULES:
+        if any(needle in key for needle in needles):
+            return category
+    return _DEFAULT_ACTIVITY_CATEGORY
+
 _RUN_SUMMARY_EXCLUDED_KEYS = {
     "ownerDisplayName",
     "ownerFullName",
@@ -429,14 +473,21 @@ def _privacy_is_private(value: Any) -> bool | None:
     return str(key).lower() == "private"
 
 
-def _extract_run(raw: dict[str, Any]) -> dict[str, Any] | None:
+def _extract_activity(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize any Garmin activity — running or not.
+
+    Ne renvoie None que si la charge utile est inexploitable (pas d'activityId) :
+    le tri par sport se fait sur `type`, à la lecture, pas ici. Voir
+    `activity_category` pour la correspondance typeKey → catégorie.
+    """
     activity_type = raw.get("activityType") or {}
     type_key = (
         activity_type.get("typeKey", "").lower()
         if isinstance(activity_type, dict)
         else ""
     )
-    if type_key not in RUNNING_TYPE_KEYS:
+    category = activity_category(type_key)
+    if raw.get("activityId") is None:
         return None
 
     start_raw = raw.get("startTimeLocal", "")
@@ -470,7 +521,7 @@ def _extract_run(raw: dict[str, Any]) -> dict[str, Any] | None:
         "garmin_activity_id": activity_id,
         "source": "garmin",
         "athlete_id": raw.get("ownerId") or 0,
-        "name": raw.get("activityName") or "Run",
+        "name": raw.get("activityName") or category,
         "start_date_local": start_iso,
         "distance": float(raw.get("distance") or 0),
         "moving_time": int(raw.get("movingDuration") or raw.get("duration") or 0),
@@ -483,8 +534,9 @@ def _extract_run(raw: dict[str, Any]) -> dict[str, Any] | None:
         "calories": raw.get("calories") or 0,
         "average_cadence": cadence,
         "max_cadence": (max_cadence_raw / 2.0) if max_cadence_raw else None,
-        "sport_type": "Run",
-        "type": "Run",
+        "sport_type": category,
+        "type": category,
+        "garmin_type_key": type_key or None,
         "has_heartrate": bool(raw.get("averageHR")),
         "pr_count": 0,
         "suffer_score": None,
@@ -536,6 +588,19 @@ def _extract_run(raw: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _extract_run(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Vue « courses seulement » de `_extract_activity`.
+
+    Conservée pour les appelants qui n'ont de sens que sur du running
+    (scripts/backfill_garmin_run_metrics.py, tests) : eux continuent de recevoir
+    None sur une rando, sans avoir à connaître les catégories.
+    """
+    activity = _extract_activity(raw)
+    if activity is None or activity.get("type") != "Run":
+        return None
+    return activity
+
+
 def _run_identifier_strings(run: dict[str, Any]) -> set[str]:
     return {
         str(value)
@@ -554,6 +619,117 @@ def _filter_tombstoned_runs(
     """Pure anti-resurrection filter used by freshness and unit tests."""
     normalized = {str(value) for value in tombstone_ids}
     return [run for run in runs if not (_run_identifier_strings(run) & normalized)]
+
+
+# ── Appareils étrangers ──
+#
+# Un compte Garmin peut recevoir les activités d'une montre qui n'est pas la
+# tienne : il suffit qu'elle ait été appairée au profil, et ses sorties entrent
+# en base au milieu des tiennes — avec leurs records.
+#
+# Le filtre ne peut pas se contenter de `get_devices()` : Garmin RENUMÉROTE une
+# même montre à chaque réappairage, et cet appel ne renvoie que l'identifiant
+# courant. S'y fier seul ferait rejeter tout l'historique. Les identifiants
+# acceptés sont donc cumulés depuis quatre sources (voir `_allowed_device_ids`),
+# dont la base elle-même : une montre qui a déjà alimenté la base reste connue.
+#
+# Aucune graine n'est écrite ici : des identifiants d'appareils sont propres à un
+# compte, et en coder en dur ferait rejeter les montres de tous les autres. Pour
+# les cas que les quatre sources ne couvrent pas :
+#
+#   GARMIN_ALLOWED_DEVICE_IDS=1111111111,2222222222   # accepter explicitement
+#   GARMIN_BLOCKED_DEVICE_IDS=3333333333              # refuser nommément
+#
+# Un identifiant bloqué est refusé même si Garmin le liste parmi tes appareils :
+# c'est la seule façon d'écarter une montre étrangère encore appairée.
+
+
+def _int_set_from_env(name: str) -> set[int]:
+    """Lit une liste d'identifiants d'appareils depuis l'environnement."""
+    ids: set[int] = set()
+    for chunk in (os.environ.get(name) or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            print(f"[GARMIN] {name}: valeur ignorée {chunk!r}", file=sys.stderr)
+    return ids
+
+
+def _account_device_ids(api: Garmin) -> set[int]:
+    """Identifiants des appareils réellement enregistrés sur le compte."""
+    ids: set[int] = set()
+    try:
+        for device in api.get_devices() or []:
+            raw = device.get("deviceId") if isinstance(device, dict) else None
+            if raw:
+                ids.add(int(raw))
+    except Exception as exc:
+        print(
+            f"[GARMIN] get_devices indisponible: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    return ids
+
+
+def _env_device_ids() -> set[int]:
+    """Échappatoire manuelle : GARMIN_ALLOWED_DEVICE_IDS=123,456."""
+    return _int_set_from_env("GARMIN_ALLOWED_DEVICE_IDS")
+
+
+def _blocked_device_ids() -> set[int]:
+    """Appareils refusés nommément : GARMIN_BLOCKED_DEVICE_IDS=123,456."""
+    return _int_set_from_env("GARMIN_BLOCKED_DEVICE_IDS")
+
+
+def _allowed_device_ids(api: Garmin) -> set[int]:
+    """Appareils dont on accepte les activités.
+
+    Trois sources cumulées : les appareils actuellement enregistrés sur le
+    compte (c'est par là qu'un futur réappairage entre tout seul), ceux qui ont
+    déjà alimenté la base (c'est par là que l'historique survit à une
+    renumérotation), et l'override d'environnement. Un ensemble vide signifie
+    « impossible de conclure » : l'appelant laisse alors tout passer plutôt que
+    de perdre des courses en silence.
+    """
+    allowed = _account_device_ids(api) | _env_device_ids()
+    try:
+        allowed |= db.get_known_device_ids()
+    except Exception as exc:
+        print(
+            f"[GARMIN] get_known_device_ids indisponible: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    return allowed - _blocked_device_ids()
+
+
+def _is_foreign_device(activity: dict[str, Any], allowed: set[int]) -> bool:
+    """Vrai si l'activité vient d'un appareil qui n'est pas à toi.
+
+    Deux abstentions volontaires :
+      - `allowed` vide → on ne sait pas, donc on n'écarte rien (fail-open) ;
+      - activité sans appareil (imports Strava, saisies manuelles, deviceId 0)
+        → elle n'a pas été enregistrée par une montre, le filtre ne la concerne
+        pas.
+    Un appareil de GARMIN_BLOCKED_DEVICE_IDS est refusé dans tous les cas, y
+    compris quand le filtre est par ailleurs désactivé.
+    """
+    raw = activity.get("garmin_device_id")
+    if raw is None:
+        return False
+    try:
+        device_id = int(raw)
+    except (TypeError, ValueError):
+        return False
+    if device_id <= 0:
+        return False
+    if device_id in _blocked_device_ids():
+        return True
+    if not allowed:
+        return False
+    return device_id not in allowed
 
 
 def _parse_existing_starts(existing: list[dict[str, Any]]) -> list[tuple[datetime, float]]:
@@ -589,6 +765,120 @@ def _is_duplicate(run: dict[str, Any], existing_parsed: list[tuple[datetime, flo
     return False
 
 
+# Le doublon observé vient de deux appareils lancés presque simultanément : la
+# montre en « Randonnée », le téléphone en « Marche ». Une fenêtre courte évite
+# de confondre des activités légitimes enchaînées (muscu puis escalade, par ex.).
+SAME_OUTING_SECONDS = 120
+_DUPLICATE_CROSS_TRAINING_TYPE_PAIRS = {
+    frozenset(("Hike", "Walk")),
+}
+
+
+def _activity_start(activity: dict[str, Any]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(
+            str(activity.get("start_date_local", "")).replace("Z", "")
+        ).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _parse_existing_outings(
+    existing: list[dict[str, Any]],
+) -> list[tuple[datetime, str]]:
+    """Pre-parse les sorties hors course utiles au dédoublon."""
+    parsed = []
+    for row in existing:
+        start = _activity_start(row)
+        activity_type = str(row.get("type") or "")
+        if start is not None and activity_type != "Run":
+            parsed.append((start, activity_type))
+    return parsed
+
+
+def _is_same_outing_pair(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    """Vrai uniquement pour le doublon Garmin observé Hike + Walk."""
+    type_pair = frozenset((
+        str(first.get("type") or ""),
+        str(second.get("type") or ""),
+    ))
+    if type_pair not in _DUPLICATE_CROSS_TRAINING_TYPE_PAIRS:
+        return False
+    first_start = _activity_start(first)
+    second_start = _activity_start(second)
+    if first_start is None or second_start is None:
+        return False
+    return abs((first_start - second_start).total_seconds()) <= SAME_OUTING_SECONDS
+
+
+def _is_same_outing(
+    activity: dict[str, Any], existing_parsed: list[tuple[datetime, str]]
+) -> bool:
+    """Une activité hors course déjà enregistrée sous un autre sport ?
+
+    Contrairement à `_is_duplicate`, aucun test de distance : quand Garmin
+    enregistre la même rando en « Randonnée » et en « Marche à pied », les deux
+    traces divergent franchement (4 582 m contre 8 834 m sur le 02/08/2026 —
+    48 % d'écart, très au-delà des 2 % tolérés pour une course). Le départ commun
+    reste le signal temporel fiable, mais on ne fusionne que la paire de types
+    réellement observée (`Hike` + `Walk`). Deux sports enchaînés restent donc
+    distincts.
+    """
+    start = _activity_start(activity)
+    if start is None:
+        return False
+    activity_type = str(activity.get("type") or "")
+    return any(
+        frozenset((activity_type, db_type)) in _DUPLICATE_CROSS_TRAINING_TYPE_PAIRS
+        and abs((start - db_dt).total_seconds()) <= SAME_OUTING_SECONDS
+        for db_dt, db_type in existing_parsed
+    )
+
+
+def _outing_completeness(activity: dict[str, Any]) -> tuple[float, int]:
+    """Trace la plus complète d'abord : distance, puis durée."""
+    return (
+        float(activity.get("distance") or 0),
+        int(activity.get("moving_time") or activity.get("elapsed_time") or 0),
+    )
+
+
+def _dedupe_cross_training(
+    activities: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Réduit à une ligne les sorties hors course enregistrées deux fois.
+
+    Les deux copies arrivent en général dans le même lot de synchro : le
+    dédoublon contre la base ne les voit donc pas passer, il faut aussi comparer
+    les candidats entre eux. On garde la trace la plus complète — sur les trois
+    doublons d'août 2026, c'est à chaque fois la « Randonnée » de la montre
+    plutôt que la « Marche à pied ».
+
+    Les courses traversent sans être touchées : leur dédoublon Strava/Garmin
+    reste `_is_duplicate`, qui compare aussi les distances.
+    """
+    others = [a for a in activities if a.get("type") != "Run"]
+    kept_others: list[dict[str, Any]] = []
+    kept_ids: set[Any] = set()
+    dropped: list[dict[str, Any]] = []
+
+    for candidate in sorted(others, key=_outing_completeness, reverse=True):
+        if any(_is_same_outing_pair(candidate, kept) for kept in kept_others):
+            dropped.append(candidate)
+            continue
+        kept_others.append(candidate)
+        kept_ids.add(candidate.get("id"))
+
+    # Ordre d'origine conservé (Garmin sert du plus récent au plus ancien).
+    kept = [
+        a for a in activities
+        if a.get("type") == "Run" or a.get("id") in kept_ids
+    ]
+    return kept, dropped
+
+
 def _safe(getter, label):
     """Call a Garmin getter, log + swallow errors. Returns None on failure."""
     try:
@@ -600,27 +890,34 @@ def _safe(getter, label):
 
 # ── Phase 3: best efforts from splits ──
 
-_BEST_EFFORT_TARGETS = [
-    ("5K", 5000),
-    ("10K", 10000),
-    ("Half-Marathon", 21097),
-    ("Marathon", 42195),
-]
+_BEST_EFFORT_TARGETS = list(db.EFFORT_TARGET_METERS.items())
 
 
-def _compute_best_efforts(activity_id: int, cum: list[tuple[float, float]]) -> list[dict[str, Any]]:
+def _compute_best_efforts(
+    activity_id: int,
+    cum: list[tuple[float, float]],
+    altitude: list[float | None] | None = None,
+) -> list[dict[str, Any]]:
     """Best efforts from cumulative (distance_m, time_s) samples.
 
     Resolution follows the input: stream samples when available (precise),
     lap boundaries otherwise (coarse). Two-pointer sweep, O(n) per target.
     The frontend falls back to pace-estimation when best_efforts are absent, so
-    this only improves accuracy, never breaks Records."""
+    this only improves accuracy, never breaks Records.
+
+    `altitude` (aligné sur `cum`) écarte les fenêtres descendantes : un 5K perdu
+    500 m d'altitude n'est pas un record, c'est de la gravité. On garde la
+    fenêtre la plus rapide dont la perte nette reste sous
+    db.MAX_NET_DROP_PER_KM ; sans altitude on ne filtre rien (comportement
+    historique) et elevation_delta reste None."""
     efforts: list[dict[str, Any]] = []
     if not cum:
         return efforts
     n = len(cum)
+    alt = altitude if altitude and len(altitude) == n else None
     for idx, (name, meters) in enumerate(_BEST_EFFORT_TARGETS, start=1):
-        best = None
+        max_drop = db.MAX_NET_DROP_PER_KM * (meters / 1000.0)
+        best: tuple[float, float | None] | None = None
         j = 0
         for i in range(n):
             d0 = cum[i - 1][0] if i > 0 else 0.0
@@ -632,15 +929,26 @@ def _compute_best_efforts(activity_id: int, cum: list[tuple[float, float]]) -> l
             if j >= n:
                 break  # windows starting later can't reach the target either
             dur = cum[j][1] - t0
-            if dur > 0 and (best is None or dur < best):
-                best = dur
+            if dur <= 0:
+                continue
+            delta = None
+            if alt is not None:
+                a0 = alt[i - 1] if i > 0 else alt[0]
+                a1 = alt[j]
+                if a0 is not None and a1 is not None:
+                    delta = a1 - a0
+                    if delta < -max_drop:
+                        continue  # descente : chrono non comparable
+            if best is None or dur < best[0]:
+                best = (dur, delta)
         if best is not None:
             efforts.append({
                 "id": int(activity_id) * 100 + idx,
                 "name": name,
                 "distance": meters,
-                "moving_time": int(best),
-                "elapsed_time": int(best),
+                "moving_time": int(best[0]),
+                "elapsed_time": int(best[0]),
+                "elevation_delta": best[1],
             })
     return efforts
 
@@ -796,11 +1104,19 @@ def _enrich_activity(api: Garmin, aid: int, distance: float, start_iso: str = ""
     #    lap-derived otherwise (coarse, like before).
     splits: list[dict[str, Any]] = []
     cum: list[tuple[float, float]] = []
+    alt: list[float | None] = []
     if streams:
         time_col = streams["time"]["data"]
         dist_col = streams["distance"]["data"]
+        alt_col = (streams.get("altitude") or {}).get("data") or []
         splits = _splits_from_streams(time_col, dist_col)
-        cum = [(d, t) for d, t in zip(dist_col, time_col) if d is not None and t is not None]
+        # cum et alt restent alignés index par index : _compute_best_efforts lit
+        # l'altitude aux bornes de la fenêtre qu'il retient.
+        for i, (d, t) in enumerate(zip(dist_col, time_col)):
+            if d is None or t is None:
+                continue
+            cum.append((d, t))
+            alt.append(alt_col[i] if i < len(alt_col) else None)
     if not splits and lap_rows:
         build_cum = not cum
         cd = 0.0
@@ -815,7 +1131,7 @@ def _enrich_activity(api: Garmin, aid: int, distance: float, start_iso: str = ""
                 cd += lap["distance"]
                 ct += lap["elapsed_time"]
                 cum.append((cd, ct))
-    best_efforts = _compute_best_efforts(aid, cum)
+    best_efforts = _compute_best_efforts(aid, cum, alt)
 
     got_data = bool(lap_rows) or points > 0
     give_up = False
@@ -826,9 +1142,13 @@ def _enrich_activity(api: Garmin, aid: int, distance: float, start_iso: str = ""
         except Exception:
             pass
     try:
+        # replace_efforts dès qu'on a une série de référence : un re-fetch doit
+        # pouvoir *supprimer* un record devenu inéligible (fenêtre descendante),
+        # pas seulement en réécrire le chrono.
         db.upsert_activity_details(aid, splits, best_efforts, distance,
                                    mark_fetched=got_data or give_up,
-                                   replace_splits=bool(splits))
+                                   replace_splits=bool(splits),
+                                   replace_efforts=bool(cum))
     except Exception as exc:
         print(f"[GARMIN] upsert_activity_details({aid}) failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False
@@ -1402,6 +1722,25 @@ def _sync_run_health(
         result["health_missing"] = missing
 
 
+def _refresh_runner_profile(result: dict[str, Any]) -> None:
+    """Recale le profil du coureur sur ce que la base sait maintenant.
+
+    Point d'accroche unique : tous les appelants (backend self-hosted, fonction
+    Vercel, scripts) passent par check_and_populate. Cabler ce rafraichissement
+    dans chaque appelant aurait garanti d'en oublier un, et le plan serait alors
+    reste calibre sur des records perimes selon le chemin emprunte.
+    """
+    try:
+        from runner_profile_sync import refresh_observed_profile
+
+        result["runner_profile_refreshed"] = refresh_observed_profile()
+    except Exception as exc:  # pragma: no cover - jamais bloquant
+        print(
+            f"[GARMIN] profil coureur non rafraichi (non-fatal): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def check_and_populate(token_dir: str = "") -> dict[str, Any]:
     global GARMIN_TOKEN_DIR
     if token_dir:
@@ -1453,16 +1792,35 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
 
     tombstone_ids = db.get_activity_tombstone_ids()
 
-    try:
-        existing_recent = _parse_existing_starts(
-            db.get_activities_start_dates_since(after_dt.isoformat())
+    allowed_devices = _allowed_device_ids(api)
+    if allowed_devices:
+        print(
+            f"[GARMIN] appareils autorisés: {sorted(allowed_devices)}",
+            file=sys.stderr,
         )
+    else:
+        print(
+            "[GARMIN] aucun appareil identifié — filtre par appareil désactivé",
+            file=sys.stderr,
+        )
+
+    try:
+        existing_rows = db.get_activities_start_dates_since(after_dt.isoformat())
     except Exception:
-        existing_recent = []
+        existing_rows = []
+    # Deux dédoublons distincts : les courses se comparent sur départ + distance
+    # (même run vu par Strava et par Garmin), les autres sports sur le seul
+    # départ (même sortie enregistrée sous deux types par Garmin).
+    existing_recent = _parse_existing_starts(
+        [r for r in existing_rows if r.get("type") == "Run"]
+    )
+    existing_outings = _parse_existing_outings(
+        [r for r in existing_rows if r.get("type") != "Run"]
+    )
 
     new_activities: list[dict[str, Any]] = []
     recent_known_activities: list[dict[str, Any]] = []
-    total_garmin_runs = 0
+    total_garmin_activities = 0
     try:
         offset = 0
         per_page = 100
@@ -1471,56 +1829,76 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
             if not isinstance(page, list) or not page:
                 break
 
-            page_dated_runs = 0
+            page_dated_activities = 0
             page_has_recent = False
             for raw in page:
-                run = _extract_run(raw)
-                if run is None:
+                activity = _extract_activity(raw)
+                if activity is None:
                     continue
-                total_garmin_runs += 1
-                if _is_tombstoned_run(run, tombstone_ids):
+                total_garmin_activities += 1
+                if _is_tombstoned_run(activity, tombstone_ids):
                     print(
-                        f"[GARMIN] run {run['id']} ignoré "
-                        "(supprimé par l'utilisateur)",
+                        f"[GARMIN] activité {activity['id']} ignorée "
+                        "(supprimée par l'utilisateur)",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                if _is_foreign_device(activity, allowed_devices):
+                    print(
+                        f"[GARMIN] activité {activity['id']} ignorée — appareil "
+                        f"{activity.get('garmin_device_id')} inconnu du compte "
+                        f"({activity.get('name')!r}, {activity.get('start_date_local')})",
                         file=sys.stderr,
                     )
                     continue
 
                 try:
-                    run_dt = datetime.fromisoformat(
-                        run["start_date_local"].replace("Z", "")
+                    activity_dt = datetime.fromisoformat(
+                        activity["start_date_local"].replace("Z", "")
                     ).replace(tzinfo=None)
                 except Exception:
-                    run_dt = None
-                if run_dt is not None:
-                    page_dated_runs += 1
-                    if run_dt < after_dt:
+                    activity_dt = None
+                if activity_dt is not None:
+                    page_dated_activities += 1
+                    if activity_dt < after_dt:
                         continue
                     page_has_recent = True
 
-                if run["id"] in known_ids:
-                    recent_known_activities.append(run)
+                if activity["id"] in known_ids:
+                    recent_known_activities.append(activity)
                     continue
 
-                if _is_duplicate(run, existing_recent):
+                is_run = activity["type"] == "Run"
+                if is_run and _is_duplicate(activity, existing_recent):
                     print(
-                        f"[GARMIN] duplicate skipped: id={run['id']} "
-                        f"start={run['start_date_local']} dist={run['distance']:.0f}m",
+                        f"[GARMIN] duplicate skipped: id={activity['id']} "
+                        f"start={activity['start_date_local']} dist={activity['distance']:.0f}m",
+                        file=sys.stderr,
+                    )
+                    continue
+                if not is_run and _is_same_outing(activity, existing_outings):
+                    print(
+                        f"[GARMIN] même sortie déjà en base, ignorée : "
+                        f"id={activity['id']} name={activity['name']!r} "
+                        f"start={activity['start_date_local']}",
                         file=sys.stderr,
                     )
                     continue
 
-                new_activities.append(run)
+                new_activities.append(activity)
                 print(
-                    f"[GARMIN] new run: id={run['id']} name={run['name']!r} "
-                    f"start={run['start_date_local']} dist={run['distance']:.0f}m",
+                    f"[GARMIN] new {activity['type']}: id={activity['id']} "
+                    f"name={activity['name']!r} "
+                    f"garmin_type={activity.get('garmin_type_key') or '?'} "
+                    f"start={activity['start_date_local']} dist={activity['distance']:.0f}m",
                     file=sys.stderr,
                 )
 
             # Garmin serves activities newest-first (the 500 cap below already
-            # relies on it): once a whole page of dated runs predates after_dt,
-            # every later page does too — no point fetching them.
-            if page_dated_runs > 0 and not page_has_recent:
+            # relies on it): once a whole page of dated activities predates
+            # after_dt, every later page does too — no point fetching them.
+            if page_dated_activities > 0 and not page_has_recent:
                 break
             if len(page) < per_page:
                 break
@@ -1541,6 +1919,18 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
         return result
 
     _save_api_tokens(api, token_dir)
+
+    # Les deux copies d'une même sortie arrivent dans le même lot : le contrôle
+    # contre la base ci-dessus ne les voit pas, il faut les comparer entre elles.
+    new_activities, same_outing = _dedupe_cross_training(new_activities)
+    for activity in same_outing:
+        print(
+            f"[GARMIN] même sortie en double dans le lot, ignorée : "
+            f"id={activity['id']} name={activity['name']!r} "
+            f"({activity['distance']:.0f}m)",
+            file=sys.stderr,
+        )
+    result["same_outing_skipped"] = len(same_outing)
 
     # Refresh run-specific summary metrics for recent known Garmin activities.
     # The DB helper compares the retained raw summary first, so unchanged runs
@@ -1578,9 +1968,12 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
     except Exception as exc:
         print(f"[GARMIN] details retry failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    result["garmin_returned"] = total_garmin_runs
+    result["garmin_returned"] = total_garmin_activities
     result["garmin_runs"] = len(new_activities)
     result["new_after_dedup"] = len(new_activities)
+    result["new_non_runs"] = sum(
+        1 for a in new_activities if a.get("type") != "Run"
+    )
 
     if not new_activities:
         print("[GARMIN] no new activities", file=sys.stderr)
@@ -1594,6 +1987,7 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
             _sync_run_health(api, result)
         except Exception as exc:
             print(f"[GARMIN] health sync failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
+        _refresh_runner_profile(result)
         return result
 
     try:
@@ -1612,16 +2006,25 @@ def check_and_populate(token_dir: str = "") -> dict[str, Any]:
     except Exception as exc:
         print(f"[GARMIN] weather sync failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    # L'enrichissement lourd (laps, splits, streams, records, snapshot santé) ne
+    # concerne que les courses : une rando ou une sortie vélo est stockée telle
+    # quelle, sans appel Garmin supplémentaire ni entrée dans les records.
+    new_runs = [a for a in new_activities if a.get("type") == "Run"]
+
     # Health/fatigue snapshot at run end: sleep, HRV and resting heart rate.
     try:
-        _sync_run_health(api, result, new_activities)
+        _sync_run_health(api, result, new_runs)
     except Exception as exc:
         print(f"[GARMIN] health sync failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
 
     # Phase 3: fetch splits per new activity and compute best efforts (Records).
     try:
-        _fetch_details(api, new_activities, result)
+        _fetch_details(api, new_runs, result)
     except Exception as exc:
         print(f"[GARMIN] details fetch failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Les records viennent d'etre recalcules : le profil du coureur, et donc les
+    # allures du plan, doivent suivre.
+    _refresh_runner_profile(result)
 
     return result

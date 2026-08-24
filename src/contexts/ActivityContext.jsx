@@ -9,6 +9,7 @@ import { parseLocalDate, localDateStr } from '../lib/compute'
 import { useNow } from '../lib/clock'
 
 const ActivityContext = createContext(null)
+const DEFAULT_DATE_RANGE = { presetDays: 365 }
 
 // Progressive loading: non-overlapping date segments, newest first. Each is a
 // small bounded [since, before) query that never hits the serverless gateway
@@ -41,6 +42,10 @@ function freshnessWarning(result) {
   if (!result) return 'Synchro Garmin impossible. Vérifiez la connexion puis réessayez.'
   if (result.reauth_required) return 'Session Garmin expirée. Reconnectez-vous pour relancer la synchro.'
   if (result.skipped && result.skipped !== 'no_session') return `Synchro Garmin interrompue (${result.skipped}).`
+  if (result.database_sync && !result.database_sync.ok) {
+    const done = (result.database_sync.synchronized || []).join(', ') || 'la base active'
+    return `Runs synchronisés sur ${done}, mais une autre base est indisponible. Réessayez quand elle sera accessible.`
+  }
   return null
 }
 
@@ -49,7 +54,7 @@ export function ActivityProvider({ initialShoes = [], children }) {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState(null)
-  const [dateRange, setDateRange] = useState(null)
+  const [dateRange, setDateRange] = useState(DEFAULT_DATE_RANGE)
   const [shoes, setShoes] = useState(() => {
     const cached = getCachedShoes()
     return initialShoes.length > 0 ? initialShoes : cached
@@ -163,9 +168,9 @@ export function ActivityProvider({ initialShoes = [], children }) {
   // in Neon. Works the same on localhost and Vercel (see
   // /api/data/freshness-check). Runs after the initial DB read so the
   // dashboard is never gated on a Garmin round-trip.
-  const runFreshnessCheck = useCallback(async () => {
-    console.log('[CONTEXT] Running freshness check against Garmin…')
-    const result = await checkFreshness()
+  const runFreshnessCheck = useCallback(async ({ allDatabases = false } = {}) => {
+    console.log(`[CONTEXT] Running freshness check against Garmin${allDatabases ? ' and all databases' : ''}…`)
+    const result = await checkFreshness({ allDatabases })
     if (!result) {
       console.log('[CONTEXT] freshness check: no result (auth or network issue)')
       setSyncWarning(freshnessWarning(result))
@@ -272,17 +277,17 @@ export function ActivityProvider({ initialShoes = [], children }) {
   }, [allActivities])
 
   // ── Manual refresh ──
-  // Le bouton "synchro" doit faire les deux : poller Garmin (sinon rien
-  // d'intéressant à voir si rien n'a changé en base) puis recharger la DB.
+  // Le bouton "synchro" fait les trois opérations : poller Garmin, converger
+  // toutes les bases disponibles, puis recharger la base active.
   // runFreshnessCheck recharge déjà tout seul quand added > 0 ; sinon on
   // force un loadFromServer pour que le clic ait toujours un effet visible.
   const refresh = useCallback(async () => {
     if (syncing) return
-    console.log('[CONTEXT] Manual refresh: freshness check + reload from DB')
+    console.log('[CONTEXT] Manual refresh: Garmin + all databases + reload')
     setSyncing(true)
     let added = 0
     try {
-      added = await runFreshnessCheck()
+      added = await runFreshnessCheck({ allDatabases: true })
     } catch (e) {
       console.warn('[CONTEXT] Manual refresh: freshness failed:', e?.message || e)
     }

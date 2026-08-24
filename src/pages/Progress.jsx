@@ -523,7 +523,7 @@ export default function Progress() {
           </div>
 
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3 sm:gap-4 mb-6 sm:mb-8 progress_zones_stats_grid" data-name="progress_zones_stats_grid">
-            <StatCard label="FC max estimee" value={maxHr} unit="bpm" name="progress_zones_stat_max_hr" />
+            <StatCard label="FC max utilisée" value={maxHr} unit="bpm" name="progress_zones_stat_max_hr" />
             <StatCard label="Aerobic" value={distribution.aerobic} unit="%" name="progress_zones_stat_aerobic" />
             <StatCard label="Anaerobic" value={distribution.anaerobic} unit="%" name="progress_zones_stat_anaerobic" />
             <StatCard label="Temps total" value={Math.round(distribution.totalMinutes / 60)} unit="h" name="progress_zones_stat_total_time" />

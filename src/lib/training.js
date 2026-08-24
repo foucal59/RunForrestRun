@@ -4,7 +4,10 @@
 
 import { parseLocalDate as parseDate, localDateStr as dayKey, getMonday } from './compute'
 import { getNow } from './clock'
-import { getManualFcMax } from './heartRateZones'
+import {
+  getObservedMaxHrForDate,
+  getManualFcMax,
+} from './heartRateZones'
 
 const clamp01 = value => Math.max(0, Math.min(1, value))
 
@@ -196,17 +199,9 @@ export function computeLoadDistribution(activities, { fcMax: fcMaxOverride } = {
   let fcMax = fcMaxOverride
   if (!fcMax || fcMax <= 0) {
     const overrideHr = getManualFcMax()
-
-    const d90ago = now.getTime() - 90 * 86400000
-    let maxHrObs = 0
-    for (const a of activities) {
-      if (!a.max_heartrate) continue
-      const t = parseDate(a.start_date_local).getTime()
-      if (t >= d90ago) {
-        if (a.max_heartrate > maxHrObs) maxHrObs = a.max_heartrate
-      }
-    }
-    fcMax = overrideHr > 0 ? overrideHr : (maxHrObs > 0 ? Math.round(maxHrObs) : 190)
+    fcMax = overrideHr > 0
+      ? overrideHr
+      : getObservedMaxHrForDate(activities, now)
   }
 
   const zoneBounds = [

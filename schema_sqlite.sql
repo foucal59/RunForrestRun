@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS activities (
     water_estimated REAL,
     garmin_workout_id INTEGER,
     garmin_course_id INTEGER,
+    -- typeKey Garmin brut ; `type`/`sport_type` gardent la categorie grossiere.
+    garmin_type_key TEXT,
     hr_time_in_zones TEXT,
     power_time_in_zones TEXT,
     garmin_fastest_splits TEXT,
@@ -128,7 +130,10 @@ CREATE TABLE IF NOT EXISTS activity_best_efforts (
     name TEXT,
     distance REAL,
     moving_time INTEGER,
-    elapsed_time INTEGER
+    elapsed_time INTEGER,
+    -- Denivele net (m) sur la fenetre du record : positif = ca monte.
+    -- NULL = inconnu ; une fenetre trop descendante n'est pas stockee du tout.
+    elevation_delta REAL
 );
 
 CREATE TABLE IF NOT EXISTS activity_splits (
@@ -253,6 +258,15 @@ CREATE TABLE IF NOT EXISTS bikes (
 CREATE TABLE IF NOT EXISTS sync_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Ajustements du plan decides par le coach (voir daily_training_plan).
+CREATE TABLE IF NOT EXISTS plan_overrides (
+    day TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    note TEXT,
+    source TEXT,
     updated_at TEXT DEFAULT (datetime('now'))
 );
 

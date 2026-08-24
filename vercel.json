@@ -4,11 +4,15 @@
   "framework": "vite",
   "rewrites": [
     {
+      "source": "/api/coach/journal",
+      "destination": "/coach-journal.json"
+    },
+    {
       "source": "/api/(.*)",
       "destination": "/api/app"
     },
     {
-      "source": "/(.*)",
+      "source": "/((?!assets/).*)",
       "destination": "/index.html"
     }
   ],

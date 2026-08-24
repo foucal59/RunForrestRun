@@ -234,6 +234,10 @@ class PostgresReplicationIntegrationTests(unittest.TestCase):
                 INSERT INTO sync_tombstones (entity_type, entity_id, deleted_at)
                 VALUES ('activity', '5', '2026-07-15T12:00:00Z')
             """)
+            self._execute(neon, """
+                INSERT INTO activities (id, name, type, start_date_local, updated_at)
+                VALUES (6, 'Neon hike', 'Hike', NOW(), '2026-07-15T10:00:00Z')
+            """)
             neon.commit()
 
             self._execute(local, """
@@ -276,6 +280,10 @@ class PostgresReplicationIntegrationTests(unittest.TestCase):
                 VALUES ('garmin_tokens', '{"side":"local-new"}',
                         '2026-07-15T11:00:00Z')
             """)
+            self._execute(local, """
+                INSERT INTO activities (id, name, type, start_date_local, updated_at)
+                VALUES (7, 'Local ride', 'Ride', NOW(), '2026-07-15T11:00:00Z')
+            """)
             local.commit()
         finally:
             neon.close()
@@ -283,6 +291,7 @@ class PostgresReplicationIntegrationTests(unittest.TestCase):
 
         first = self._run_sync()
         self.assertIn("small_rows=3", first.stderr)
+        self.assertIn("cross_training=2", first.stderr)
         self.assertIn("tombstones=1", first.stderr)
 
         neon = self._connect(self.neon_url)
@@ -294,11 +303,22 @@ class PostgresReplicationIntegrationTests(unittest.TestCase):
                         conn, "SELECT id FROM activities ORDER BY id"
                     ).fetchall()
                 }
-                self.assertEqual(ids, {1, 2, 3, 4})
+                self.assertEqual(ids, {1, 2, 3, 4, 6, 7})
                 statuses = self._execute(
-                    conn, "SELECT DISTINCT sync_status FROM activities"
+                    conn, "SELECT DISTINCT sync_status FROM activities WHERE type = 'Run'"
                 ).fetchall()
                 self.assertEqual({row[0] for row in statuses}, {"ok"})
+                cross_training = self._execute(conn, """
+                    SELECT id, name FROM activities
+                    WHERE type <> 'Run' ORDER BY id
+                """).fetchall()
+                self.assertEqual(
+                    [list(row) for row in cross_training],
+                    [
+                        [6, "Neon hike"],
+                        [7, "Local ride"],
+                    ],
+                )
                 component = self._execute(conn, """
                     SELECT vo2max, hr_time_in_zones
                     FROM activities WHERE id = 3
@@ -355,6 +375,7 @@ class PostgresReplicationIntegrationTests(unittest.TestCase):
         self.assertIn("pending=0", second.stderr)
         self.assertIn("actions=0", second.stderr)
         self.assertIn("small_rows=0", second.stderr)
+        self.assertIn("cross_training=0", second.stderr)
         self.assertIn("tombstones=0", second.stderr)
 
 

@@ -12,50 +12,59 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import statistics
 import sys
-from pathlib import Path
 
-# Profil du coureur. Ces valeurs sont propres a chacun : renseigne-les via un
-# fichier JSON (COACH_PROFILE_FILE, defaut <repo>/coach_profile.json) plutot que
-# de les coder en dur. Les valeurs ci-dessous ne sont qu'un exemple neutre.
-DEFAULT_PROFILE = {
-    "pr_5k": "",
-    "pr_10k": "",
-    "pr_marathon": "",
-    "objectif": "",
-    "fc_facile": 140,
-    "fc_max": 190,
+
+def fmt_record(seconds, km):
+    """'45:00 (4:30/km)', ou '' si le record n'est pas connu."""
+    if not seconds:
+        return ""
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    clock = f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+    pace = int(round(total / km))
+    return f"{clock} ({pace // 60}:{pace % 60:02d}/km)"
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from runner_profile import PROFILE as RUNNER  # noqa: E402
+
+# Le profil du coureur vient de `runner_profile` : objectif, FC max de repli et
+# allures y sont deja resolus (fichier du coureur, environnement, ou snapshot
+# Garmin). Les records et les references cardiaques sont ensuite RELUS dans le
+# dump a chaque generation par profile_for() — figer un record ici rendrait le
+# coach aveugle a un meilleur effort et le ferait calibrer sur un chrono perime.
+PROFILE = {
+    "pr_5k": fmt_record(RUNNER.records.get("5k"), 5.0),
+    "pr_10k": fmt_record(RUNNER.records.get("10k"), 10.0),
+    "pr_semi": fmt_record(RUNNER.records.get("semi"), 21.0975),
+    "pr_marathon": fmt_record(RUNNER.records.get("marathon"), 42.195),
+    "objectif": (
+        f"{RUNNER.race_name}, {RUNNER.race_date.isoformat()} — calibrage "
+        f"{RUNNER.goal_label} ({RUNNER.pace('marathon')})"
+    ),
+    # La FC facile n'est qu'un repli : easy_hr_reference() la relit dans le dump.
+    "fc_facile": int(round(RUNNER.max_hr * 0.78)),
+    "fc_max": RUNNER.max_hr,
 }
 
-
-def _load_profile() -> dict:
-    """Charge le profil depuis COACH_PROFILE_FILE, sinon renvoie l'exemple neutre."""
-    path = os.environ.get("COACH_PROFILE_FILE") or str(
-        Path(__file__).resolve().parent.parent / "coach_profile.json"
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return {**DEFAULT_PROFILE, **json.load(fh)}
-    except FileNotFoundError:
-        return dict(DEFAULT_PROFILE)
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"[coach_journal] profil illisible ({path}): {exc}", file=sys.stderr)
-        return dict(DEFAULT_PROFILE)
-
-
-PROFILE = _load_profile()
-
-# Zones d'allure (min/km)
+# Zones d'allure (min/km), derivees de l'objectif : une table recopiee ici
+# divergerait de celle du site des le premier ajustement d'objectif.
 ZONES = {
-    "Recuperation": (6 * 60 + 35, 7 * 60 + 5),
-    "Footing facile": (6 * 60 + 15, 6 * 60 + 45),
-    "Endurance moyenne": (5 * 60 + 55, 6 * 60 + 15),
-    "Allure marathon": (5 * 60 + 25, 5 * 60 + 35),
-    "Allure semi": (5 * 60 + 15, 5 * 60 + 25),
-    "Seuil": (5 * 60, 5 * 60 + 10),
-    "VO2max": (4 * 60 + 40, 4 * 60 + 55),
-    "Lignes": (4 * 60 + 20, 4 * 60 + 35),
+    label: (int(round(RUNNER.paces[key][0])), int(round(RUNNER.paces[key][1])))
+    for label, key in (
+        ("Recuperation", "recovery"),
+        ("Footing facile", "easy"),
+        ("Endurance moyenne", "steady"),
+        ("Allure marathon", "marathon"),
+        ("Allure semi", "semi"),
+        ("Seuil", "threshold"),
+        ("VO2max", "vo2"),
+        ("Lignes", "strides"),
+    )
 }
 
 
@@ -78,6 +87,49 @@ def parse_copy(path, table, activity_ids=None):
     return rows
 
 
+_COPY_UNESCAPES = (("\\t", "\t"), ("\\n", "\n"), ("\\r", "\r"), ("\\\\", "\\"))
+
+
+def unescape_copy_value(value):
+    """Decode une valeur du format texte de COPY (backslash-escapes)."""
+    if not value:
+        return value
+    out = []
+    i = 0
+    while i < len(value):
+        if value[i] == "\\" and i + 1 < len(value):
+            pair = value[i:i + 2]
+            replacement = next((rep for esc, rep in _COPY_UNESCAPES if esc == pair), None)
+            if replacement is not None:
+                out.append(replacement)
+                i += 2
+                continue
+        out.append(value[i])
+        i += 1
+    return "".join(out)
+
+
+def parse_plan_overrides(path):
+    """Ajustements du coach presents dans le dump, prets pour set_plan_overrides."""
+    overrides = {}
+    for row in parse_copy(path, "plan_overrides"):
+        day = (row.get("day") or "").strip()
+        payload = row.get("payload")
+        if not day or not payload or payload == "\\N":
+            continue
+        try:
+            session = json.loads(unescape_copy_value(payload))
+        except (TypeError, ValueError):
+            print(f"[coach-journal] plan_overrides[{day}] illisible, ignore", file=sys.stderr)
+            continue
+        note = row.get("note")
+        overrides[day] = {
+            "session": session,
+            "note": None if note in (None, "", "\\N") else unescape_copy_value(note),
+        }
+    return overrides
+
+
 def fnum(v):
     try:
         return float(v)
@@ -92,6 +144,260 @@ def _toint(v):
         return None
 
 
+def dump_source_info(path):
+    """Provenance du dump, pour qu'une date de generation ne masque pas sa fraicheur."""
+    display_path = os.path.normpath(os.fspath(path))
+    absolute = os.path.abspath(display_path)
+    try:
+        stat = os.stat(absolute)
+    except OSError:
+        return {
+            "path": display_path,
+            "exists": False,
+            "modified_at": None,
+            "age_seconds": None,
+        }
+
+    modified = dt.datetime.fromtimestamp(stat.st_mtime).astimezone()
+    now = dt.datetime.now().astimezone()
+    return {
+        "path": display_path,
+        "exists": True,
+        "modified_at": modified.isoformat(timespec="seconds"),
+        "age_seconds": max(0, int((now - modified).total_seconds())),
+    }
+
+
+# Les quatre distances que garmin_freshness recalcule : un record relu dans le
+# dump prime toujours sur ce que le profil du coureur annonce.
+PROFILE_PR_KEYS = {
+    "5K": "pr_5k",
+    "10K": "pr_10k",
+    "Half-Marathon": "pr_semi",
+    "Marathon": "pr_marathon",
+}
+
+EASY_HR_WINDOW_DAYS = 42
+EASY_HR_MIN_DURATION_SECONDS = 25 * 60
+EASY_HR_PACE_MIN_SECONDS = 5 * 60 + 20
+EASY_HR_PACE_MAX_SECONDS = 5 * 60 + 40
+EASY_HR_MIN_SAMPLES = 3
+EASY_HR_MAX_AVERAGE_FOR_BASELINE = 151
+_QUALITY_NAME_RE = re.compile(
+    r"(?:\bfraction|\bseuil|\bvo2|\binterval|\btempo|\ballure marathon|\bam\b|\b\d+\s*x\s*\d+)",
+    re.IGNORECASE,
+)
+
+
+def easy_hr_reference(
+    run_rows,
+    as_of,
+    *,
+    default=PROFILE["fc_facile"],
+    structured_quality_ids=None,
+):
+    """Baseline FC facile robuste, sans confondre qualite et endurance.
+
+    On retient les moyennes cardiaques des runs d'au moins 25 minutes dont
+    l'allure moyenne est dans la bande facile 5:20-5:40/km, puis leur mediane.
+    Moins de trois observations ne suffisent pas a remplacer le repli connu :
+    la mediane observee reste exposee pour rendre ce choix explicable.
+    """
+    try:
+        if isinstance(as_of, dt.datetime):
+            day = as_of.date()
+        elif isinstance(as_of, dt.date):
+            day = as_of
+        else:
+            day = dt.date.fromisoformat(str(as_of)[:10])
+    except (TypeError, ValueError):
+        day = None
+
+    structured_quality_ids = {str(value) for value in (structured_quality_ids or set())}
+    samples = []
+    excluded_quality_count = 0
+    if day is not None:
+        for row in run_rows or []:
+            if row.get("type") not in (None, "Run"):
+                continue
+            stamp_value = row.get("date") or row.get("start_date_local")
+            try:
+                stamp = dt.date.fromisoformat(str(stamp_value)[:10])
+            except (TypeError, ValueError):
+                continue
+            age = (day - stamp).days
+            if not 0 <= age <= EASY_HR_WINDOW_DAYS:
+                continue
+
+            seconds = fnum(row.get("moving_time"))
+            distance_m = fnum(row.get("distance")) or fnum(row.get("distance_m"))
+            if distance_m is None and fnum(row.get("distance_km")) is not None:
+                distance_m = fnum(row.get("distance_km")) * 1000
+            average_hr = fnum(row.get("average_heartrate"))
+            if not seconds or seconds < EASY_HR_MIN_DURATION_SECONDS or not distance_m or distance_m <= 0:
+                continue
+            if average_hr is None or not 30 <= average_hr <= 250:
+                continue
+
+            pace = seconds / (distance_m / 1000.0)
+            if not EASY_HR_PACE_MIN_SECONDS <= pace <= EASY_HR_PACE_MAX_SECONDS:
+                continue
+            # Une qualite peut afficher 5:20-5:40/km sur la moyenne globale a
+            # cause de l'echauffement et des recuperations. Son nom structure ou
+            # une FC moyenne deja soutenue l'excluent de la baseline facile.
+            is_structured_quality = str(row.get("id")) in structured_quality_ids
+            if (
+                is_structured_quality
+                or _QUALITY_NAME_RE.search(str(row.get("name") or ""))
+                or average_hr > EASY_HR_MAX_AVERAGE_FOR_BASELINE
+            ):
+                excluded_quality_count += 1
+                continue
+            samples.append(average_hr)
+
+    observed_median = statistics.median(samples) if samples else None
+    enough_samples = len(samples) >= EASY_HR_MIN_SAMPLES
+    value = int(round(observed_median)) if enough_samples else int(default)
+    return {
+        "value": value,
+        "source": "observed_median_42d" if enough_samples else "fallback",
+        "observedMedian": round(observed_median, 1) if observed_median is not None else None,
+        "sampleCount": len(samples),
+        "minimumSamples": EASY_HR_MIN_SAMPLES,
+        "windowDays": EASY_HR_WINDOW_DAYS,
+        "minimumDurationMinutes": EASY_HR_MIN_DURATION_SECONDS // 60,
+        "paceRangeSecPerKm": [EASY_HR_PACE_MIN_SECONDS, EASY_HR_PACE_MAX_SECONDS],
+        "maximumAverageHr": EASY_HR_MAX_AVERAGE_FOR_BASELINE,
+        "excludedQualityCount": excluded_quality_count,
+        "qualityDetection": "laps_then_name_and_average_hr",
+        "fallbackReason": None if enough_samples else "insufficient_samples",
+    }
+
+
+def _structured_quality_activity_ids(dump_path, run_rows, as_of):
+    """Runs a intervalles prouves par leurs laps, meme avec un nom Garmin generique."""
+    from daily_training_plan import _interval_structure
+
+    try:
+        day = as_of if isinstance(as_of, dt.date) else dt.date.fromisoformat(str(as_of)[:10])
+    except (TypeError, ValueError):
+        return set()
+
+    candidates = []
+    for row in run_rows:
+        try:
+            stamp = dt.date.fromisoformat(str(row.get("start_date_local") or row.get("date"))[:10])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= (day - stamp).days <= EASY_HR_WINDOW_DAYS and row.get("id") not in (None, "", "\\N"):
+            candidates.append(row)
+
+    candidate_ids = {str(row["id"]) for row in candidates}
+    if not candidate_ids:
+        return set()
+
+    laps_by_activity = {}
+    for lap in parse_copy(dump_path, "activity_laps", candidate_ids):
+        laps_by_activity.setdefault(str(lap.get("activity_id")), []).append(lap)
+
+    quality_ids = set()
+    for row in candidates:
+        activity_id = str(row["id"])
+        seconds = fnum(row.get("moving_time")) or 0
+        distance_m = fnum(row.get("distance")) or 0
+        interval_run = {
+            # Laisser l'id vide evite de polluer le cache et les logs du moteur.
+            "id": None,
+            "date": str(row.get("start_date_local") or "")[:10],
+            "moving_time": seconds,
+            "distance_m": distance_m,
+            "distance_km": distance_m / 1000 if distance_m else 0,
+            "pace_sec_per_km": seconds / (distance_m / 1000) if seconds and distance_m else 0,
+            "average_heartrate": fnum(row.get("average_heartrate")) or 0,
+            "max_heartrate": fnum(row.get("max_heartrate")) or 0,
+            "laps": planner_laps(laps_by_activity.get(activity_id, [])),
+        }
+        if _interval_structure(interval_run)[0]:
+            quality_ids.add(activity_id)
+    return quality_ids
+
+
+def profile_for(dump_path, as_of=None):
+    """PROFILE avec records et references cardiaques relus dans le dump.
+
+    Meme regle de lecture que le site (database_pg.get_computed_bests_bulk) :
+    seules les activites 'Run' comptent, et une fenetre trop descendante est
+    ecartee via MAX_NET_DROP_PER_KM — sinon un chrono en descente deviendrait un
+    record ici alors que la page Records le refuse, et les deux chemins coach
+    diraient a nouveau deux choses differentes.
+
+    Dump illisible ou table absente : on garde les valeurs de PROFILE. Un record
+    perime vaut mieux qu'un plantage de la generation matinale.
+    """
+    from best_effort_rules import EFFORT_TARGET_METERS, is_downhill_assisted
+    from heart_rate_reference import max_hr_reference
+
+    try:
+        activity_rows = parse_copy(dump_path, "activities")
+        efforts = parse_copy(dump_path, "activity_best_efforts")
+    except OSError as exc:
+        print(f"[coach-journal] records illisibles ({exc}), PROFILE fige conserve", file=sys.stderr)
+        activity_rows, efforts = [], []
+
+    run_rows = [row for row in activity_rows if row.get("type") == "Run"]
+    run_ids = {row.get("id") for row in run_rows}
+
+    best = {}
+    for row in efforts:
+        name = row.get("name")
+        if name not in PROFILE_PR_KEYS or row.get("activity_id") not in run_ids:
+            continue
+        seconds = _toint(row.get("moving_time")) or _toint(row.get("elapsed_time"))
+        if not seconds:
+            continue
+        if is_downhill_assisted(fnum(row.get("elevation_delta")), fnum(row.get("distance"))):
+            continue
+        if name not in best or seconds < best[name]:
+            best[name] = seconds
+
+    profile = dict(PROFILE)
+    for name, seconds in best.items():
+        km = EFFORT_TARGET_METERS[name] / 1000.0
+        profile[PROFILE_PR_KEYS[name]] = f"{fmt_duration(seconds)} ({fmt_pace(seconds / km)})"
+        if PROFILE[PROFILE_PR_KEYS[name]] and profile[PROFILE_PR_KEYS[name]] != PROFILE[PROFILE_PR_KEYS[name]]:
+            print(
+                f"[coach-journal] {name} relu dans le dump : "
+                f"{PROFILE[PROFILE_PR_KEYS[name]]} -> {profile[PROFILE_PR_KEYS[name]]}",
+                file=sys.stderr,
+            )
+
+    reference_day = as_of or dt.date.today()
+    max_hr = max_hr_reference(
+        run_rows,
+        reference_day.isoformat() if isinstance(reference_day, dt.date) else str(reference_day),
+        default=PROFILE["fc_max"],
+    )
+    structured_quality_ids = _structured_quality_activity_ids(dump_path, run_rows, reference_day)
+    easy_hr = easy_hr_reference(
+        run_rows,
+        reference_day,
+        structured_quality_ids=structured_quality_ids,
+    )
+    profile["fc_max"] = int(round(max_hr["value"]))
+    profile["fc_max_reference"] = max_hr
+    profile["fc_facile"] = easy_hr["value"]
+    profile["fc_facile_reference"] = easy_hr
+    return profile
+
+
+def fmt_duration(seconds):
+    """45:00 pour un 10K, 1:38:07 pour un semi."""
+    seconds = int(round(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def fmt_pace(sec_per_km):
     if not sec_per_km or sec_per_km <= 0:
         return "-"
@@ -103,6 +409,19 @@ def fmt_pace(sec_per_km):
     return f"{m}:{s:02d}/km"
 
 
+def rolling_run_volume(runs, today, days=7):
+    """Distance des `days` dates glissantes, aujourd'hui inclus.
+
+    Pour 7 jours le delta valide est 0..6. L'ancienne condition `<= 7`
+    couvrait huit dates et affichait 70,9 km le 17 aout au lieu de 60,7 km.
+    """
+    return sum(
+        run["dist"]
+        for run in runs
+        if 0 <= (today - run["dt"].date()).days < days
+    )
+
+
 def render_guidance_session(guidance):
     title = guidance.get("title") or "Seance coach"
     session = guidance.get("session") or {}
@@ -110,17 +429,83 @@ def render_guidance_session(guidance):
     return f"{title} : {main}"
 
 
-def planner_run_payload(run):
+# Fenetre des activites hors course remontees au coach. 21 jours : assez large
+# pour couvrir un week-end de rando ou de ski en debut de bloc, assez court pour
+# que le snapshot reste une photo de la charge actuelle.
+CROSS_TRAINING_WINDOW_DAYS = 21
+
+# Libelles lisibles pour la categorie stockee en base (activities.type).
+CROSS_TRAINING_LABELS = {
+    "Hike": "Randonnee",
+    "Walk": "Marche",
+    "Ride": "Velo",
+    "Swim": "Natation",
+    "Ski": "Ski",
+    "Rowing": "Rame / pagaie",
+    "RockClimbing": "Escalade",
+    "WeightTraining": "Renforcement",
+    "Workout": "Seance croisee",
+    "Other": "Autre",
+}
+
+
+def cross_training_payload(activity):
+    """Une activite hors course, reduite a ce qui pese sur la fraicheur."""
+    duration = _toint(activity.get("moving_time")) or _toint(activity.get("elapsed_time")) or 0
+    distance_m = fnum(activity.get("distance")) or 0
+    kind = activity.get("type") or "Other"
+    minutes = round(duration / 60)
+    # Les runs s'affichent en mm:ss ; une rando de 3 h donnerait "191:43", illisible.
+    duree = f"{minutes // 60}h{minutes % 60:02d}" if minutes >= 60 else f"{minutes} min"
     return {
+        "date": activity["_dt"].date().isoformat(),
+        "type": kind,
+        "sport": CROSS_TRAINING_LABELS.get(kind, kind),
+        "sport_garmin": activity.get("garmin_type_key") or None,
+        "nom": activity.get("name") or CROSS_TRAINING_LABELS.get(kind, kind),
+        "distance_km": round(distance_m / 1000.0, 2),
+        "duree": duree,
+        "duree_minutes": minutes,
+        "denivele_m": _toint(activity.get("total_elevation_gain")) or 0,
+        "fc_moy": _toint(activity.get("average_heartrate")),
+    }
+
+
+def planner_run_payload(run):
+    payload = {
         "id": f"{run['dt'].date().isoformat()}-{run['name'] or 'run'}",
         "date": run["dt"].date().isoformat(),
         "start_date_local": run["dt"].isoformat(),
         "distance_km": round(run["dist"], 2),
+        "distance_m": round(run["dist"] * 1000, 1),
         "moving_time": run["mt"],
         "pace_sec_per_km": run["pace"],
         "average_heartrate": _toint(run["hr"]),
         "max_heartrate": _toint(run["mhr"]),
     }
+    # Les laps permettent au plan d'identifier les blocs de travail et les
+    # seances clees deja couvertes.
+    if run.get("laps"):
+        payload["laps"] = run["laps"]
+    return payload
+
+
+def planner_laps(laps):
+    """Laps du dump SQL, normalises pour l'adaptation du plan."""
+    out = []
+    for index, lap in enumerate(sorted(laps, key=lambda l: _toint(l.get("lap_index")) or 0)):
+        seconds = _toint(lap.get("moving_time")) or _toint(lap.get("elapsed_time")) or 0
+        meters = fnum(lap.get("distance")) or 0
+        if seconds <= 0 or meters <= 0:
+            continue
+        out.append({
+            "lap_index": _toint(lap.get("lap_index")) or index,
+            "moving_time": seconds,
+            "distance_m": meters,
+            "average_heartrate": fnum(lap.get("average_heartrate")),
+            "max_heartrate": fnum(lap.get("max_heartrate")),
+        })
+    return out
 
 
 def classify(name, pace, laps, detected_fast=None):
@@ -337,6 +722,66 @@ def _laps_match_stream_repetitions(lap_fast, stream_fast):
     return stream_distance > 0 and abs(lap_distance - stream_distance) / stream_distance <= 0.20
 
 
+def run_metrics(a):
+    """Metriques detaillees d'un run pour l'analyse coach : foulee, D+, effet
+    d'entrainement, sante du jour et meteo. Lues directement sur la ligne
+    activites deja parsee (aucun parseur ad hoc supplementaire)."""
+    def _cad(v):
+        n = fnum(v)
+        return round(n * 2) if n is not None else None  # Strava stocke la cadence par jambe
+    def _temp(v):
+        n = fnum(v)
+        return round(n, 1) if n is not None else None
+    def _clean(v):
+        return None if v in (None, "", "\\N") else v
+
+    stride = fnum(a.get("avg_stride_length"))          # cm
+    gct = fnum(a.get("avg_ground_contact_time"))       # ms
+    vosc = fnum(a.get("avg_vertical_oscillation"))     # cm
+    vratio = fnum(a.get("avg_vertical_ratio"))         # %
+
+    zones = None
+    raw = a.get("hr_time_in_zones")
+    if raw and raw != "\\N":
+        try:
+            data = json.loads(unescape_copy_value(raw))
+            zones = {int(z["zone"]): int(round(fnum(z.get("seconds")) or 0)) for z in data}
+        except (TypeError, ValueError, KeyError):
+            zones = None
+
+    return {
+        "denivele_positif_m": _toint(a.get("total_elevation_gain")),
+        "denivele_negatif_m": _toint(a.get("elevation_loss")),
+        "cadence_spm": _cad(a.get("average_cadence")),
+        "cadence_max_spm": _cad(a.get("max_cadence")),
+        "longueur_foulee_m": round(stride / 100, 2) if stride is not None else None,
+        "temps_contact_sol_ms": round(gct) if gct is not None else None,
+        "oscillation_verticale_cm": round(vosc, 1) if vosc is not None else None,
+        "ratio_vertical_pct": round(vratio, 1) if vratio is not None else None,
+        "effet_aerobie": round(fnum(a.get("aerobic_training_effect")), 1) if fnum(a.get("aerobic_training_effect")) is not None else None,
+        "effet_anaerobie": round(fnum(a.get("anaerobic_training_effect")), 1) if fnum(a.get("anaerobic_training_effect")) is not None else None,
+        "charge_entrainement": _toint(a.get("activity_training_load")),
+        "label_effet": _clean(a.get("training_effect_label")),
+        "vo2max": _toint(a.get("vo2max")),
+        "fc_temps_par_zone_s": zones,
+        "meteo": {
+            "temperature_c": _temp(a.get("weather_temperature")),
+            "ressenti_c": _temp(a.get("weather_apparent_temperature")),
+            "humidite_pct": _toint(a.get("weather_humidity")),
+            "vent_kmh": _toint(a.get("weather_wind_speed")),
+            "code": _toint(a.get("weather_code")),
+        },
+        "sante": {
+            "sommeil_score": _toint(a.get("health_sleep_score")),
+            "sommeil_duree_s": _toint(a.get("health_sleep_duration_seconds")),
+            "vfc_ms": _toint(a.get("health_hrv_last_night_avg_ms")),
+            "vfc_statut": _clean(a.get("health_hrv_status")),
+            "fc_repos_bpm": _toint(a.get("health_resting_hr_bpm")),
+            "fc_repos_7j_bpm": _toint(a.get("health_resting_hr_7d_avg_bpm")),
+        },
+    }
+
+
 def analyse_run(a, laps_by_act, streams_by_act=None):
     dist = (fnum(a.get("distance")) or 0) / 1000
     mt = int(fnum(a.get("moving_time")) or 0)
@@ -370,6 +815,8 @@ def analyse_run(a, laps_by_act, streams_by_act=None):
         "dt": a["_dt"], "dist": dist, "mt": mt, "pace": pace,
         "hr": hr, "mhr": mhr, "kind": kind, "fast": fast, "fast_source": fast_source,
         "name": a.get("name"),
+        "laps": planner_laps(laps),
+        "metrics": run_metrics(a),
     }
 
 
@@ -384,12 +831,13 @@ def main():
     args = ap.parse_args()
 
     today = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+    source_dump = dump_source_info(args.dump)
 
+    profile = profile_for(args.dump, today)
     acts = parse_copy(args.dump, "activities")
     runs = []
+    others = []
     for a in acts:
-        if a.get("type") != "Run":
-            continue
         sd = a.get("start_date_local")
         if not sd or sd == "\\N":
             continue
@@ -397,12 +845,36 @@ def main():
             a["_dt"] = dt.datetime.fromisoformat(sd.replace("Z", "")[:19])
         except ValueError:
             continue
+        if a.get("type") != "Run":
+            # Rando, velo, ski, muscu... : hors statistiques de course, mais le
+            # coach doit les voir pour juger la charge reelle (D+, temps sur pieds)
+            # avant de programmer une seance a enjeu le lendemain.
+            others.append(a)
+            continue
         # privilegier garmin si doublon (meme date+distance approx)
         runs.append(a)
     runs.sort(key=lambda x: x["_dt"], reverse=True)
+    others.sort(key=lambda x: x["_dt"], reverse=True)
+    recent_others = [
+        a for a in others
+        if 0 <= (today - a["_dt"].date()).days <= CROSS_TRAINING_WINDOW_DAYS
+    ][:10]
 
     sys.path.insert(0, proj)
-    from daily_training_plan import build_daily_training_guidance, build_three_day_training_guidance
+    from daily_training_plan import (
+        build_three_day_training_guidance,
+        set_plan_overrides,
+    )
+
+    # Les ajustements du coach vivent en base (table plan_overrides) : sans eux le
+    # snapshot repartirait du calendrier fige et contredirait le site.
+    plan_overrides = parse_plan_overrides(args.dump)
+    set_plan_overrides(plan_overrides)
+    if plan_overrides:
+        print(
+            f"[coach-journal] {len(plan_overrides)} ajustement(s) coach appliques",
+            file=sys.stderr,
+        )
 
     # 10 derniers runs distincts (dedup garmin/strava : meme jour + distance ~ identique)
     last_activities, seen = [], []
@@ -427,30 +899,40 @@ def main():
         streams_by_act.setdefault(stream.get("activity_id"), []).append(stream)
     last_runs = [analyse_run(activity, laps_by_act, streams_by_act) for activity in last_activities]
 
-    # volume 7 jours glissants
-    vol = sum(r["dist"] for r in last_runs if (today - r["dt"].date()).days <= 7)
+    # volume 7 jours glissants (aujourd'hui + les 6 dates precedentes)
+    vol = rolling_run_volume(last_runs, today)
 
     planner_runs = [planner_run_payload(r) for r in last_runs]
     guidance = build_three_day_training_guidance(today.isoformat(), planner_runs, None)
-    future_guidance = [
-        build_daily_training_guidance(
-            today + dt.timedelta(days=offset),
-            planner_runs,
-            None,
-            as_of_day=today,
-            apply_adjustments=False,
-        )
-        for offset in range(1, 4)
-    ]
+    # Ne pas reconstruire J+1 a J+3 un par un : la fenetre multi-jours est la
+    # sortie unique du site, deja reconciliee avec les runs et les overrides.
+    # La recalculer ici avait cree un second chemin susceptible de diverger.
+    future_guidance = (guidance.get("sessions") or [])[1:4]
+    current_week = guidance.get("currentWeek") or {}
 
     # --- rendu markdown ---
     L = []
-    L.append("# Journal Coach")
+    L.append(f"# Journal Coach - {RUNNER.race_name}")
     L.append(f"_Genere le {today.isoformat()} a partir des donnees Garmin/Strava locales._\n")
     L.append("## Profil & objectif")
-    L.append(f"- Objectif : {PROFILE['objectif']}")
-    L.append(f"- Records : marathon {PROFILE['pr_marathon']} ; 10K {PROFILE['pr_10k']} ; 5K {PROFILE['pr_5k']}")
-    L.append(f"- FC facile ~{PROFILE['fc_facile']} / FC max ~{PROFILE['fc_max']}")
+    L.append(f"- Objectif : {profile['objectif']}")
+    L.append(f"- Records : marathon {profile['pr_marathon']} ; 10K {profile['pr_10k']} ; 5K {profile['pr_5k']}")
+    easy_ref = profile["fc_facile_reference"]
+    max_ref = profile["fc_max_reference"]
+    easy_detail = (
+        f"mediane {easy_ref['windowDays']} j, {easy_ref['sampleCount']} runs"
+        if easy_ref["source"] == "observed_median_42d"
+        else "repli personnel, echantillon insuffisant"
+    )
+    max_detail = (
+        f"observee le {max_ref['observedOn']} sur {max_ref['windowDays']} j"
+        if max_ref["source"] == "observed_90d"
+        else "repli personnel, aucune observation recente"
+    )
+    L.append(
+        f"- FC facile observee ~{profile['fc_facile']} ({easy_detail}) / "
+        f"FC max utilisee {profile['fc_max']} ({max_detail})"
+    )
     L.append(f"- Volume 7 derniers jours : {vol:.0f} km\n")
 
     L.append("## Zones d'allure")
@@ -472,9 +954,37 @@ def main():
             L.append(f"    - Fractions{source} : {frac}")
     L.append("")
 
+    autres = [cross_training_payload(a) for a in recent_others]
+    if autres:
+        L.append(f"## Autres activites ({CROSS_TRAINING_WINDOW_DAYS} derniers jours)")
+        L.append("_Hors statistiques de course, mais comptent dans la fatigue._")
+        for a in autres:
+            d3 = dt.date.fromisoformat(a["date"])
+            j = jours[d3.weekday()]
+            detail = a["duree"]
+            if a["distance_km"]:
+                detail += f", {a['distance_km']:.1f} km"
+            if a["denivele_m"]:
+                detail += f", {a['denivele_m']} m D+"
+            if a["fc_moy"]:
+                detail += f", FCmoy {a['fc_moy']}"
+            L.append(f"- **{j} {d3.strftime('%d/%m')}** - {a['sport']} - {detail} - {a['nom']}")
+        L.append("")
+
     # lecture rapide
     nb_q = sum(1 for r in last_runs[:10] if r["kind"] == "Qualite")
     L.append("## Lecture de la semaine")
+    if current_week:
+        km_min = current_week.get("estimatedKmMin")
+        km_max = current_week.get("estimatedKmMax")
+        days_min = current_week.get("plannedRunDaysMin")
+        days_max = current_week.get("plannedRunDaysMax")
+        km_text = f"{km_min}-{km_max}" if km_min != km_max else str(km_max)
+        days_text = f"{days_min}-{days_max}" if days_min != days_max else str(days_max)
+        L.append(
+            f"- {current_week.get('label')} — {current_week.get('phaseLabel')} : "
+            f"environ {km_text} km, {days_text} sorties."
+        )
     L.append(f"- {nb_q} seance(s) qualite sur les 10 derniers runs, volume 7 jours {vol:.0f} km.")
     last = last_runs[0] if last_runs else None
     if last:
@@ -492,7 +1002,7 @@ def main():
     L.append("")
     L.append("> Regle d'ajustement : si fatigue / FC anormalement haute pour l'allure / nuit courte / "
              "forte chaleur (>30 C), alleger de 20-30 % ou remplacer par footing facile. "
-             "Utiliser l'allure cible configuree, sans empiler deux seances cles.")
+             "Allure marathon de calibrage : 4:37/km, sans empiler deux seances cles.")
 
     out = "\n".join(L) + "\n"
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -503,15 +1013,30 @@ def main():
     # --- snapshot JSON (pour le MCP) ---
     if args.json:
         payload = {
+            "schema_version": 1,
             "genere_le": today.isoformat(),
             "date_generation": today.isoformat(),
-            "objectif": PROFILE["objectif"],
+            "source_dump": source_dump,
+            "objectif": profile["objectif"],
             "profil": {
-                "pr_10k": PROFILE["pr_10k"], "pr_5k": PROFILE["pr_5k"],
-                "pr_marathon": PROFILE["pr_marathon"],
-                "fc_facile": PROFILE["fc_facile"], "fc_max": PROFILE["fc_max"],
+                "pr_10k": profile["pr_10k"], "pr_5k": profile["pr_5k"],
+                "pr_marathon": profile["pr_marathon"],
+                "fc_facile": profile["fc_facile"], "fc_max": profile["fc_max"],
+                "fc_facile_reference": profile["fc_facile_reference"],
+                "fc_max_reference": profile["fc_max_reference"],
             },
             "volume_7j_km": round(vol, 1),
+            "semaine_courante": {
+                "numero": current_week.get("index"),
+                "debut": current_week.get("start"),
+                "fin": current_week.get("end"),
+                "libelle": current_week.get("label"),
+                "phase": current_week.get("phaseLabel"),
+                "volume_km_min": current_week.get("estimatedKmMin"),
+                "volume_km_max": current_week.get("estimatedKmMax"),
+                "sorties_min": current_week.get("plannedRunDaysMin"),
+                "sorties_max": current_week.get("plannedRunDaysMax"),
+            } if current_week else None,
             "zones_allure": {z: {"min": fmt_pace(a1), "max": fmt_pace(a2)} for z, (a1, a2) in ZONES.items()},
             "seance_du_jour": {"date": today.isoformat(), "seance": render_guidance_session(guidance)},
             "derniers_runs": [
@@ -530,9 +1055,13 @@ def main():
                          "fc_max": _toint(h), "source": r["fast_source"]}
                         for d, p, h in r["fast"]
                     ],
+                    "metrics": r.get("metrics"),
                 }
                 for r in last_runs
             ],
+            # Activites hors course : le coach les lit pour juger la fatigue,
+            # jamais pour calculer volume, allures ou records.
+            "autres_activites": autres,
             "projection": [
                 {
                     "date": item["date"],
@@ -542,7 +1071,7 @@ def main():
                 for item in future_guidance
             ],
             "regle_ajustement": ("Si fatigue / FC anormalement haute / nuit courte / chaleur >30C : "
-                                 "alleger 20-30% ou footing facile. Utiliser l'allure cible configuree ; "
+                                 "alleger 20-30% ou footing facile. AM de calibrage 4:37/km ; "
                                  "ne jamais empiler deux seances cles."),
         }
         os.makedirs(os.path.dirname(args.json), exist_ok=True)

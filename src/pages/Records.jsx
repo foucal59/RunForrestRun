@@ -20,6 +20,17 @@ function fmtDate(d) {
   return d.slice(0, 10)
 }
 
+// Dénivelé net de la fenêtre du record (m, positif = ça monte). null quand le
+// run n'a pas de stream d'altitude — on n'affiche alors rien plutôt qu'un 0
+// trompeur. Les fenêtres trop descendantes sont écartées côté serveur
+// (database_pg.MAX_NET_DROP_PER_KM), elles n'arrivent jamais jusqu'ici.
+function fmtElev(delta) {
+  if (delta == null) return null
+  const rounded = Math.round(delta)
+  if (rounded === 0) return 'D± 0 m'
+  return `${rounded > 0 ? 'D+' : 'D−'} ${Math.abs(rounded)} m`
+}
+
 function timeDiff(t, best) {
   if (!t || !best || t === best) return null
   const diff = t - best
@@ -56,6 +67,14 @@ function PRCard({ config, bests }) {
               <span className="text-xs text-txt-muted records_card_section_activity_id_section_time_seconds_meta" data-name="records_card_section_activity_id_section_time_seconds_meta">{paceForDist(best.timeSeconds, config.key)}</span>
               <span className="text-xs text-txt-muted records_card_section_activity_id_section_meta" data-name="records_card_section_activity_id_section_meta">·</span>
               <span className="text-xs text-txt-muted records_card_section_activity_id_section_start_date_meta" data-name="records_card_section_activity_id_section_start_date_meta">{fmtDate(best.startDate)}</span>
+              {fmtElev(best.elevationDelta) && (
+                <>
+                  <span className="text-xs text-txt-muted records_card_section_activity_id_section_meta" data-name="records_card_section_activity_id_section_meta">·</span>
+                  <span className="text-xs text-txt-muted records_card_section_elevation_delta_meta" data-name="records_card_section_elevation_delta_meta" title="Dénivelé net sur la distance du record">
+                    {fmtElev(best.elevationDelta)}
+                  </span>
+                </>
+              )}
               {best.activityId && (
                 <Link to={`/activity/${best.activityId}`} className="text-txt-muted hover:text-brand ouvrir_dans_l_app_action_link" data-name="ouvrir_dans_l_app_action_link" title="Ouvrir dans l'app">
                   <ExternalLink size={11} />
@@ -88,7 +107,12 @@ function PRCard({ config, bests }) {
                   {timeDiff(Math.round(b.timeSeconds), Math.round(history[0].timeSeconds))}
                 </span>
               )}
-              <span className="ml-auto text-txt-muted records_card_list_i_activity_id_section_start_date_meta" data-name="records_card_list_i_activity_id_section_start_date_meta">{fmtDate(b.startDate)}</span>
+              {fmtElev(b.elevationDelta) && (
+                <span className="ml-auto text-txt-muted text-[10px] records_card_list_i_elevation_delta_meta" data-name="records_card_list_i_elevation_delta_meta" title="Dénivelé net sur la distance du record">
+                  {fmtElev(b.elevationDelta)}
+                </span>
+              )}
+              <span className={`${fmtElev(b.elevationDelta) ? '' : 'ml-auto '}text-txt-muted records_card_list_i_activity_id_section_start_date_meta`} data-name="records_card_list_i_activity_id_section_start_date_meta">{fmtDate(b.startDate)}</span>
               {b.activityId && (
                 <Link to={`/activity/${b.activityId}`} className="text-txt-muted hover:text-brand app_action_link" data-name="app_action_link" title="App">
                   <ExternalLink size={10} />
@@ -141,6 +165,10 @@ export default function Records() {
             />
           ))}
         </div>
+        <p className="text-[11px] text-txt-muted mt-3 records_section_distance_footnote" data-name="records_section_distance_footnote">
+          Les portions trop descendantes (plus de 5 m de perte d'altitude par km)
+          sont écartées : un chrono aidé par la pente n'entre pas au palmarès.
+        </p>
       </section>
     </div>
   )

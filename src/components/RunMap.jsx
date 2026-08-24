@@ -257,15 +257,15 @@ export default function RunMap({ runs, height = 400, singleRun = false, classNam
         const sat = Math.round(90 - ratio * 30)
         const light = Math.round(50 + ratio * 20)
         const color = singleRun ? '#2563EB' : `hsl(${hue},${sat}%,${light}%)`
-        const opacity = singleRun ? 0.9 : (highlighted ? 0.95 : 0.75 - ratio * 0.35)
-        const weight = highlighted ? highlightedWeightForZoom(map.getZoom()) : (singleRun ? 3.5 : 1.8)
+        const opacity = singleRun ? 0.9 : (highlighted ? 0.95 : 0.86 - ratio * 0.16)
+        const weight = highlighted ? highlightedWeightForZoom(map.getZoom()) : (singleRun ? 3.5 : 2.6)
 
         const indexedPts = thinWithIndex(run.points)
         const pts = indexedPts.map(item => item.point)
-        const halo = highlighted ? L.polyline(pts, {
-          color: '#111827',
-          weight: weight + 4,
-          opacity: 0.18,
+        const halo = !singleRun ? L.polyline(pts, {
+          color: highlighted ? '#111827' : '#ffffff',
+          weight: weight + (highlighted ? 4 : 2.5),
+          opacity: highlighted ? 0.18 : 0.7,
           smoothFactor: 1,
           interactive: false,
         }).addTo(map) : null
@@ -275,6 +275,20 @@ export default function RunMap({ runs, height = 400, singleRun = false, classNam
           opacity,
           smoothFactor: 1
         }).addTo(map)
+
+        // Keep geographically isolated runs visible when the selected range
+        // forces a wide viewport: the route may become tiny, but this marker
+        // keeps a stable on-screen footprint at every zoom level.
+        if (!singleRun) {
+          L.circleMarker(pts[Math.floor(pts.length / 2)], {
+            radius: highlighted ? 3.5 : 3,
+            color: '#ffffff',
+            weight: 1.5,
+            fillColor: color,
+            fillOpacity: 1,
+            interactive: false,
+          }).addTo(map)
+        }
 
         if (highlighted) highlightedLayers.push({ halo, polyline })
 

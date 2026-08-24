@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -242,6 +243,42 @@ class SQLiteIntegrationTests(unittest.TestCase):
                 ).fetchone()[0]
                 assert updated_at
             """)
+
+
+class GearQueryPortabilityTests(unittest.TestCase):
+    """Les requetes doivent tourner sur les DEUX moteurs, pas seulement Postgres.
+
+    `get_all_gears` faisait `primary_shoe AS primary` : « primary » est un mot
+    reserve, donc SQLite refusait la requete et /api/data/shoes renvoyait 500 en
+    mode dev — le mode que le README recommande pour demarrer sans base distante.
+    """
+
+    def test_get_all_gears_runs_on_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "gears.db"
+            result = SQLiteIntegrationTests._run(self, db_path, '''
+                import json
+                import db_sqlite as db
+
+                db.init_db()
+                db.upsert_gears([{
+                    "id": "g1",
+                    "name": "Chaussure de test",
+                    "nickname": "test",
+                    "brand_name": "Marque",
+                    "model_name": "Modele",
+                    "distance": 120000,
+                    "primary": True,
+                    "retired": False,
+                }])
+                print(json.dumps(db.get_all_gears()))
+            ''')
+
+        gears = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(gears), 1)
+        self.assertEqual(gears[0]["id"], "g1")
+        # La colonne est bien exposee sous son alias, guillemets compris.
+        self.assertIn("primary", gears[0])
 
 
 if __name__ == "__main__":

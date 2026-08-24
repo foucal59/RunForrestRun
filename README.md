@@ -1,18 +1,20 @@
 # Garmin Running Dashboard
 
 Dashboard self-hosted pour visualiser et analyser des donnees de course Garmin
-Connect. Le depot contient uniquement le code et un plan d'entrainement
-d'exemple : les identifiants, activites, traces GPS, donnees de sante et journaux
-generes restent dans l'infrastructure de chaque utilisateur.
+Connect, avec un plan marathon **genere depuis tes propres caracteristiques**.
+Le depot ne contient que du code : identifiants, activites, traces GPS, donnees
+de sante et journaux generes restent dans l'infrastructure de chaque
+utilisateur.
 
 La base de donnees (PostgreSQL) est la **source de verite**. Garmin Connect n'est
 interroge qu'a l'ouverture, via un *freshness-check*, pour combler le delta
 (nouvelles activites, VO2max, training status, equipement).
 
 > [!IMPORTANT]
-> Les allures, zones cardiaques, volumes et conseils du plan fourni sont des
-> exemples techniques. Ils doivent etre adaptes individuellement et ne
-> remplacent pas l'avis d'un professionnel de sante ou d'un entraineur.
+> Le plan, ses allures, ses zones cardiaques et ses volumes sont calcules par des
+> formules generiques (Riegel et ecarts d'entrainement usuels). C'est un point de
+> depart technique, pas une prescription : il ne remplace pas l'avis d'un
+> entraineur ou d'un professionnel de sante.
 
 ## Fonctionnalites
 
@@ -23,7 +25,77 @@ interroge qu'a l'ouverture, via un *freshness-check*, pour combler le delta
 - **Training Load** : CTL / ATL / TSB avec zones d'interpretation
 - **Zones FC** : repartition du temps dans les zones cardio (FC max contextuelle)
 - **VO2max & Training Status** : repris nativement depuis Garmin
+- **Plan** : bloc marathon complet genere depuis ton objectif et tes records
 - **Detail d'un run** : carte GPS, courbes allure/FC, meilleurs efforts (streams hydrates depuis Garmin)
+
+## Ton plan, tes allures
+
+Le plan d'entrainement n'est pas un calendrier ecrit en dur : il est **genere**
+depuis un seul nombre, ton objectif marathon. Trois facons de le renseigner, de
+la plus simple a la plus explicite.
+
+### 1. Ne rien faire
+
+Connecte ton compte Garmin. La premiere synchronisation lit tes meilleurs
+efforts (5K, 10K, semi, marathon) et la FC max reellement atteinte sur 90 jours,
+et les depose dans `.runtime/runner-profile.json`. Au demarrage suivant,
+l'objectif est **projete depuis ton meilleur record** (formule de Riegel, avec
+une marge de conversion : une projection brute suppose une endurance specifique
+deja acquise) et les huit fourchettes d'allure en decoulent.
+
+Exemple : un 10 km en 45:00 donne un calibrage marathon a 3h32, soit
+5:01/km, et avec lui un seuil a 4:39-4:49, du VO2 a 4:14-4:27 et des footings
+a 5:46-6:09.
+
+### 2. Fixer ton objectif
+
+Copie `runner_profile.example.json` vers `runner_profile.json` et renseigne ce
+que tu veux imposer. Tout y est optionnel, et une valeur presente prime toujours
+sur ce qui est observe :
+
+```json
+{
+  "raceName": "Marathon de Berlin",
+  "raceDate": "2027-09-26",
+  "planWeeks": 15,
+  "goalTime": "3:30:00",
+  "longRunWeekday": 6,
+  "longPeakKm": 32
+}
+```
+
+### 3. Variables d'environnement
+
+Pour un deploiement (Vercel), chaque cle a son equivalent : `PLAN_RACE_DATE`,
+`PLAN_WEEKS`, `RUNNER_GOAL_TIME`, `RUNNER_MAX_HR`... Voir `.env.example`. Elles
+priment sur le fichier.
+
+### Ce que le generateur produit
+
+Une periodisation complete, recalculee a chaque changement de profil :
+
+| Phase | Contenu |
+|---|---|
+| Reprise | Demi-semaine de mise en route, aucune intensite |
+| Base | Fonciere et premiers rappels de vitesse |
+| Specifique | Seuil, et blocs a allure marathon dans la sortie longue |
+| Rodage | Semi test — c'est ce chrono qui arrete la cible du jour J |
+| Affutage | Le volume tombe, l'allure specifique reste |
+
+Une semaine sur quatre est une **decharge**, et la semaine qui precede le semi
+test en est toujours une. La rampe de sortie longue va de `longStartKm` a
+`longPeakKm` ; les decharges, l'affutage et la dose d'allure marathon s'en
+deduisent. Le gabarit hebdomadaire se construit autour des trois jours que tu
+choisis (repos, qualite, sortie longue) : la veille de la sortie longue
+s'allege, le lendemain recupere, et les jours restants portent le volume.
+
+Le plan reste ajustable au jour le jour sans toucher au code, via la table
+`plan_overrides` (`scripts/ajuster_le_plan.py`) : ces ajustements priment sur la
+trame generee.
+
+`python scripts/export_plan_pdf.py` produit `public/training-plan.pdf` depuis ce
+meme calendrier — telechargeable depuis le Cockpit, donc toujours d'accord avec
+la page Plan.
 
 ## Architecture
 
@@ -81,6 +153,8 @@ est injoignable) :
    `python scripts/mirror_neon_to_local.py --full`; sans cette option, l'outil
    refuse de recopier toute Neon sur une base locale deja remplie.
 3. Ouvre http://localhost:5173 et connecte-toi avec ton compte Garmin Connect.
+   La premiere synchronisation renseigne tes records et ta FC max : le plan est
+   calibre sur tes chronos au demarrage suivant (voir « Ton plan, tes allures »).
    Les tokens sont stockes dans `GARMIN_TOKEN_DIR` (defaut `.runtime/garminconnect/`).
    Une boucle de fraicheur en arriere-plan re-verifie Garmin toutes les `SYNC_INTERVAL` secondes.
 
@@ -117,6 +191,14 @@ fois depuis ta machine avec `scripts/garmin_push_neon.py`.
 | `DB_CONNECT_TIMEOUT` | option | Timeout (s) de connexion a la base primaire (defaut 5). |
 | `DB_SECONDARY_COOLDOWN` | option | Fenetre (s) du disjoncteur de replication secondaire (defaut 120). |
 | `SQLITE_PATH` | dev | Active le repli SQLite local (aucune base distante requise). |
+| `RUNNER_GOAL_TIME` | option | Objectif marathon (`3:30:00`). Prime sur tout : les huit allures en decoulent. |
+| `RUNNER_MAX_HR` | option | Force la FC max. Vide → celle observee sur 90 jours. |
+| `RUNNER_PR_5K` / `10K` / `SEMI` / `MARATHON` | option | Records connus. Inutiles si Garmin est connecte. |
+| `PLAN_RACE_NAME` / `PLAN_RACE_DATE` | option | Identite de la course visee. |
+| `PLAN_WEEKS` / `PLAN_TAPER_WEEKS` | option | Longueur du bloc et de l'affutage (defauts 15 et 3). |
+| `PLAN_LONG_RUN_WEEKDAY` / `PLAN_QUALITY_WEEKDAY` / `PLAN_REST_WEEKDAY` | option | Gabarit hebdomadaire (0 = lundi). |
+| `PLAN_LONG_START_KM` / `PLAN_LONG_PEAK_KM` | option | Bornes de la rampe de sortie longue. |
+| `RUNNER_PROFILE_FILE` / `RUNNER_OBSERVED_FILE` | option | Chemins des fichiers de profil. |
 | `PLAN_RACE_NAME` | option | Nom affiche pour la course (defaut `Marathon`). |
 | `PLAN_START_DATE` | option | Debut du plan au format `YYYY-MM-DD`. Vide : prochain jeudi. |
 | `PLAN_RACE_DATE` | option | Date de course au format `YYYY-MM-DD`. Vide : 108 jours apres le debut. |
@@ -152,8 +234,8 @@ par Git. `scripts/coach_publish.sh` peut aussi en copier une version vers un
 dossier local configure avec `COACH_PUBLISH_DIR`, mais ne committe et ne pousse
 jamais le fichier.
 
-Renseigne d'abord `coach_profile.json` a partir de
-`coach_profile.example.json`. Pour un serveur distant, stocke le snapshot dans
+Renseigne au besoin `runner_profile.json` a partir de
+`runner_profile.example.json` (voir « Ton plan, tes allures »). Pour un serveur distant, stocke le snapshot dans
 un emplacement prive et configure `COACH_SNAPSHOT_URL` avec
 `COACH_SNAPSHOT_TOKEN`. L'endpoint `/api/coach/journal` est protege par
 `MCP_AUTH_TOKEN` sur Vercel et par un token ou une session valide en local.

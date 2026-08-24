@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Local runner for the "Running Coach" MCP server.
+"""Local runner for the "Coach Marathon" MCP server.
 
 The shared MCP tools live in coach_mcp.py so the local runner and Vercel expose
 the same contract.
 
 Source de donnees (par ordre de priorite) :
-  1. COACH_SNAPSHOT_URL  (URL privee, avec COACH_SNAPSHOT_TOKEN si necessaire)
-  2. COACH_SNAPSHOT_PATH  (fichier local, defaut: <repo>/.runtime/coach-journal.json)
+  1. COACH_SNAPSHOT_URL  (ex. https://example-dashboard.vercel.app/coach-journal.json)
+  2. COACH_SNAPSHOT_PATH  (fichier local, defaut: <repo>/public/coach-journal.json)
 
 Transports :
   - HTTP (defaut)  : python3 scripts/coach_mcp_server.py            -> http://127.0.0.1:8765/mcp/

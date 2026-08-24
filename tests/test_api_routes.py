@@ -37,8 +37,32 @@ class VercelApiRouteTests(unittest.TestCase):
         self.assertTrue(imports_workout_builder)
         self.assertIn(("get", "/api/data/plan-overview"), routes)
         self.assertIn(("post", "/api/data/workout-garmin"), routes)
+        self.assertIn(("post", "/api/data/sync"), routes)
         self.assertNotIn(("get", "/api/data/workout-fit"), routes)
         self.assertNotIn(("get", "/api/data/workout-tcx"), routes)
+
+    def test_local_server_exposes_manual_sync_route(self):
+        source = Path(__file__).resolve().parents[1] / "server.py"
+        module = ast.parse(source.read_text(encoding="utf-8"))
+        routes = []
+        for node in module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                func = decorator.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "post"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "app"
+                    and decorator.args
+                    and isinstance(decorator.args[0], ast.Constant)
+                ):
+                    routes.append((func.attr, decorator.args[0].value))
+
+        self.assertIn(("post", "/api/data/sync"), routes)
 
 
 if __name__ == "__main__":

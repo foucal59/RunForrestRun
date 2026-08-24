@@ -8,56 +8,100 @@ import { parseLocalDate as parseLocal, localDateStr, getMonday } from './compute
 import { getNow } from './clock'
 
 const FCMAX_OVERRIDE_KEY = 'garmin_fcmax_override'
+export const OBSERVED_MAX_HR_WINDOW_DAYS = 90
+export const PERSONAL_MAX_HR_FALLBACK = 181
+const MIN_PLAUSIBLE_OBSERVED_HR = 30
+const MAX_PLAUSIBLE_OBSERVED_HR = 250
 
-/**
- * Get the max HR observed in a 90-day window before a given date.
- * Used to compute contextual FC max for each individual run.
- */
-export function getMaxHrForDate(activities, targetDate, windowDays = 90) {
-  const target = parseLocal(targetDate).getTime()
-  const windowStart = target - windowDays * 86400000
+function observedHeartRate(value) {
+  const hr = Number(value)
+  return Number.isFinite(hr) && hr >= MIN_PLAUSIBLE_OBSERVED_HR && hr <= MAX_PLAUSIBLE_OBSERVED_HR
+    ? hr
+    : null
+}
 
-  let maxHr = 0
-  for (const a of activities) {
-    if (!a.max_heartrate) continue
-    const t = parseLocal(a.start_date_local).getTime()
-    if (t >= windowStart && t <= target) {
-      if (a.max_heartrate > maxHr) maxHr = a.max_heartrate
-    }
-  }
-  return maxHr > 0 ? Math.round(maxHr) : 190
+function localDayNumber(value) {
+  const parsed = parseLocal(value)
+  if (Number.isNaN(parsed.getTime())) return null
+  return Math.floor(Date.UTC(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()) / 86400000)
 }
 
 /**
- * Get the max HR observed in a window, with the date it occurred.
+ * Get the max HR observed from target calendar day - 90 through target day,
+ * inclusive. Calendar-day semantics match the Python resolver and DB queries.
+ * Used to compute contextual FC max for each individual run.
  */
-export function getMaxHrWithDate(activities, targetDate, windowDays = 90) {
-  const target = parseLocal(targetDate).getTime()
-  const windowStart = target - windowDays * 86400000
+export function getObservedMaxHrForDate(activities, targetDate, windowDays = OBSERVED_MAX_HR_WINDOW_DAYS) {
+  const targetDay = localDayNumber(targetDate)
+  if (targetDay == null) return PERSONAL_MAX_HR_FALLBACK
+  const windowStartDay = targetDay - windowDays
+
+  let maxHr = 0
+  for (const a of activities) {
+    const observed = observedHeartRate(a.max_heartrate)
+    if (observed == null) continue
+    const activityDay = localDayNumber(a.start_date_local)
+    if (activityDay != null && activityDay >= windowStartDay && activityDay <= targetDay) {
+      if (observed > maxHr) maxHr = observed
+    }
+  }
+  return maxHr > 0 ? Math.round(maxHr) : PERSONAL_MAX_HR_FALLBACK
+}
+
+/**
+ * Get the max HR observed in the same inclusive calendar-day window, with the
+ * date it occurred.
+ */
+export function getObservedMaxHrWithDate(activities, targetDate, windowDays = OBSERVED_MAX_HR_WINDOW_DAYS) {
+  const targetDay = localDayNumber(targetDate)
+  if (targetDay == null) {
+    return { hr: PERSONAL_MAX_HR_FALLBACK, date: null, source: 'personal_fallback', windowDays }
+  }
+  const windowStartDay = targetDay - windowDays
 
   let maxHr = 0
   let maxDate = null
+  let maxDay = -Infinity
   for (const a of activities) {
-    if (!a.max_heartrate) continue
-    const t = parseLocal(a.start_date_local).getTime()
-    if (t >= windowStart && t <= target) {
-      if (a.max_heartrate > maxHr) {
-        maxHr = a.max_heartrate
+    const observed = observedHeartRate(a.max_heartrate)
+    if (observed == null) continue
+    const activityDay = localDayNumber(a.start_date_local)
+    if (activityDay != null && activityDay >= windowStartDay && activityDay <= targetDay) {
+      if (observed > maxHr || (observed === maxHr && activityDay > maxDay)) {
+        maxHr = observed
         maxDate = a.start_date_local
+        maxDay = activityDay
       }
     }
   }
-  return { hr: maxHr > 0 ? Math.round(maxHr) : 190, date: maxDate }
+  return {
+    hr: maxHr > 0 ? Math.round(maxHr) : PERSONAL_MAX_HR_FALLBACK,
+    date: maxDate,
+    source: maxHr > 0 ? 'observed_90d' : 'personal_fallback',
+    windowDays,
+  }
 }
 
 /**
- * Get the current FC max from the last 90 days.
- * Respects manual override if set.
+ * Get the FC max reference currently used by the frontend, including its
+ * source. The manual override is deliberately browser-local; otherwise the
+ * maximum observed over 90 days is used, with the personal fallback as a last
+ * resort when no usable activity exists.
  */
-export function getCurrentMaxHr(activities) {
+export function getCurrentMaxHrInfo(activities) {
   const override = getManualFcMax()
-  if (override > 0) return override
-  return getMaxHrForDate(activities, new Date(getNow()), 90)
+  if (override > 0) {
+    return { hr: override, date: null, source: 'manual_local', windowDays: null }
+  }
+  return getObservedMaxHrWithDate(
+    activities,
+    new Date(getNow()),
+    OBSERVED_MAX_HR_WINDOW_DAYS
+  )
+}
+
+export function getCurrentMaxHr(activities) {
+  return getCurrentMaxHrInfo(activities).hr
 }
 
 /**
@@ -99,11 +143,11 @@ export const ZONE_LABELS = ['Z1', 'Z2', 'Z3', 'Z4', 'Z5']
  * Build zone boundaries from HRmax using our custom percentages.
  * Always uses our defined thresholds (Z1 <65%, Z2 65-75%, Z3 75-85%, Z4 85-95%, Z5 >95%).
  * @param {Array|null} _providerZones - Ignored (kept for API compat)
- * @param {number|null} maxHr - Observed max HR from activities
+ * @param {number|null} maxHr - FC max reference selected by the caller
  * @returns {Array} zones with { zone, label, min, max }
  */
 export function buildZones(_providerZones, maxHr) {
-  const hrMax = maxHr || 190
+  const hrMax = maxHr || PERSONAL_MAX_HR_FALLBACK
   return DEFAULT_ZONE_PCTS.map(z => ({
     zone: z.zone,
     label: z.label,

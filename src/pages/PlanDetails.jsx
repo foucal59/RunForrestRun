@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { CalendarDays, ChevronDown, Droplets, Flag, HeartPulse, Timer } from 'lucide-react'
+import { CalendarDays, ChevronDown, Flag, HeartPulse, Timer } from 'lucide-react'
 import { loadPlanOverview } from '../api'
 import { useActivities } from '../contexts/ActivityContext'
 import { getCurrentMaxHr } from '../lib/heartRateZones'
@@ -22,18 +22,6 @@ function fmtHrRange(pctMin, pctMax, maxHr) {
 
 function fmtHrPct(pctMin, pctMax) {
   return `${Math.round(pctMin * 100)}-${Math.round(pctMax * 100)}% FCmax`
-}
-
-function fmtRaceDate(value) {
-  if (!value) return 'date configurée'
-  const [year, month, day] = value.split('-').map(Number)
-  if (!year || !month || !day) return value
-  return new Date(year, month - 1, day).toLocaleDateString('fr-FR', {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-  })
 }
 
 function CategoryBadge({ category, label }) {
@@ -90,36 +78,6 @@ function HrTargets({ hr, maxHr }) {
   )
 }
 
-function FuelPlan({ fuel }) {
-  if (!fuel) return null
-  return (
-    <div className="plan_session_fuel" data-name="plan_session_fuel">
-      <div className="flex items-center gap-1.5 text-xs font-medium text-txt-secondary mb-1.5 plan_session_fuel_title" data-name="plan_session_fuel_title">
-        <Droplets size={13} /> Gels & glucides — <span className="text-txt">{fuel.carbTarget}</span>
-      </div>
-      {fuel.before && (
-        <p className="text-xs text-txt-secondary mb-1.5 plan_session_fuel_before" data-name="plan_session_fuel_before">{fuel.before}</p>
-      )}
-      {fuel.gels?.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-2 plan_session_fuel_gels" data-name="plan_session_fuel_gels">
-          {fuel.gels.map(g => (
-            <div key={g.label} className="px-2.5 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-500/10 plan_session_fuel_gel" data-name="plan_session_fuel_gel">
-              <div className="text-[11px] text-amber-700 dark:text-amber-400 font-medium plan_session_fuel_gel_label" data-name="plan_session_fuel_gel_label">{g.label}</div>
-              <div className="text-sm font-mono font-semibold text-txt plan_session_fuel_gel_at" data-name="plan_session_fuel_gel_at">{g.at}</div>
-              {g.note && <div className="text-[10px] text-txt-muted plan_session_fuel_gel_note" data-name="plan_session_fuel_gel_note">{g.note}</div>}
-            </div>
-          ))}
-        </div>
-      )}
-      <ul className="space-y-0.5 plan_session_fuel_notes" data-name="plan_session_fuel_notes">
-        {(fuel.notes || []).map(n => (
-          <li key={n} className="text-[11px] text-txt-muted plan_session_fuel_note" data-name="plan_session_fuel_note">• {n}</li>
-        ))}
-      </ul>
-    </div>
-  )
-}
-
 function workoutPayloadFromSession(session) {
   if (!session?.workoutEligible) return null
   return {
@@ -138,6 +96,7 @@ function SessionCard({ session, maxHr }) {
   const meta = [
     session.estimatedKm ? `~${session.estimatedKm} km` : null,
     session.estimatedDuration ? `~${session.estimatedDuration}` : null,
+    session.optional ? 'optionnel' : null,
   ].filter(Boolean).join(' · ')
 
   return (
@@ -169,6 +128,22 @@ function SessionCard({ session, maxHr }) {
               {session.title}
             </span>
             <CategoryBadge category={session.category} label={session.categoryLabel} />
+            {session.coachOverride && (
+              <span
+                className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-brand/15 text-brand plan_session_coach_badge"
+                data-name="plan_session_coach_badge"
+              >
+                Coach
+              </span>
+            )}
+            {session.adjusted && !session.coachOverride && (
+              <span
+                className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-accent/15 text-accent plan_session_adjusted_badge"
+                data-name="plan_session_adjusted_badge"
+              >
+                Ajusté
+              </span>
+            )}
           </div>
           {meta && <div className="text-[11px] text-txt-muted font-mono plan_session_meta" data-name="plan_session_meta">{meta}</div>}
         </div>
@@ -180,6 +155,21 @@ function SessionCard({ session, maxHr }) {
           />
         )}
       </button>
+
+      {(session.adjustment || session.coachNote) && (
+        <div
+          className="px-3 pb-2 -mt-1 text-[11px] leading-snug text-txt-secondary plan_session_adjustment"
+          data-name="plan_session_adjustment"
+        >
+          {session.plannedTitle && (
+            <span className="text-txt-muted">Plan initial : {session.plannedTitle} — </span>
+          )}
+          {session.adjustment}
+          {session.coachNote && (
+            <span className="text-txt-muted">{session.adjustment ? ' ' : ''}{session.coachNote}</span>
+          )}
+        </div>
+      )}
 
       {session.workoutEligible && (
         <div className="px-3 pb-2 -mt-1 flex justify-end plan_session_workouts" data-name="plan_session_workouts">
@@ -210,7 +200,6 @@ function SessionCard({ session, maxHr }) {
           </div>
           <PaceChips paces={session.paces} />
           <HrTargets hr={session.hr} maxHr={maxHr} />
-          <FuelPlan fuel={session.fuel} />
         </div>
       )}
     </div>
@@ -219,6 +208,16 @@ function SessionCard({ session, maxHr }) {
 
 function WeekCard({ week, maxHr }) {
   const [open, setOpen] = useState(Boolean(week.isCurrent))
+  const kmMin = week.estimatedKmMin ?? week.estimatedKm
+  const kmMax = week.estimatedKmMax ?? week.estimatedKm
+  const volumeLabel = kmMax
+    ? ` · ~${kmMin !== kmMax ? `${kmMin}–${kmMax}` : kmMax} km planifiés`
+    : ''
+  const runDaysLabel = week.plannedRunDaysMax
+    ? ` · ${week.plannedRunDaysMin !== week.plannedRunDaysMax
+      ? `${week.plannedRunDaysMin}–${week.plannedRunDaysMax}`
+      : week.plannedRunDaysMax} sorties`
+    : ''
   return (
     <div className={`card p-0 overflow-hidden plan_week ${week.isPast ? 'opacity-70' : ''}`} data-name={`plan_week_${week.start}`}>
       <button
@@ -237,7 +236,7 @@ function WeekCard({ week, maxHr }) {
             )}
           </div>
           <div className="text-xs text-txt-muted plan_week_subtitle" data-name="plan_week_subtitle">
-            {week.phaseLabel}{week.estimatedKm ? ` · ~${week.estimatedKm} km planifiés` : ''}
+            {week.phaseLabel}{volumeLabel}{runDaysLabel}
           </div>
         </div>
         <ChevronDown
@@ -248,7 +247,9 @@ function WeekCard({ week, maxHr }) {
       </button>
       {open && (
         <div className="px-3 pb-3 space-y-2 plan_week_sessions" data-name="plan_week_sessions">
-          {week.sessions.map(s => <SessionCard key={s.date} session={s} maxHr={maxHr} />)}
+          {week.sessions.map(s => (
+            <SessionCard key={s.date} session={s} maxHr={maxHr} />
+          ))}
         </div>
       )}
     </div>
@@ -316,7 +317,7 @@ export default function PlanDetails() {
           value={nextKeySession ? nextKeySession.dayLabel : '—'}
           name="plan_stat_next_key"
         />
-        <StatCard label="FC max (90 j)" value={`${maxHr} bpm`} name="plan_stat_fcmax" />
+        <StatCard label="FC max utilisée" value={`${maxHr} bpm`} name="plan_stat_fcmax" />
       </div>
 
       {nextKeySession && (
@@ -332,7 +333,7 @@ export default function PlanDetails() {
       {/* Références d'allures et FC cibles */}
       <div className="card mb-6 plan_pace_refs_card" data-name="plan_pace_refs_card">
         <h3 className="text-sm font-medium text-txt-secondary mb-3 plan_pace_refs_title" data-name="plan_pace_refs_title">
-          Références d'allures & FC cibles <span className="font-normal text-txt-muted">(FCmax {maxHr} bpm, 90 derniers jours)</span>
+          Références d'allures & FC cibles <span className="font-normal text-txt-muted">(FC max utilisée : {maxHr} bpm · réglage local ou maximum observé sur 90 j)</span>
         </h3>
         <div className="data_table_scroller plan_pace_refs_scroller" data-name="plan_pace_refs_scroller">
           <table className="w-full text-sm plan_pace_refs_table" data-name="plan_pace_refs_table">
@@ -362,47 +363,14 @@ export default function PlanDetails() {
         </div>
       </div>
 
-      {/* Stratégie gels */}
-      <div className="card mb-6 plan_fuel_card" data-name="plan_fuel_card">
-        <h3 className="flex items-center gap-1.5 text-sm font-medium text-txt-secondary mb-2 plan_fuel_title" data-name="plan_fuel_title">
-          <Droplets size={14} /> {plan.fuelStrategy.title}
-        </h3>
-        <p className="text-xs text-txt-secondary mb-2 plan_fuel_diagnosis" data-name="plan_fuel_diagnosis">{plan.fuelStrategy.diagnosis}</p>
-        <p className="text-sm font-medium text-txt mb-2 plan_fuel_target" data-name="plan_fuel_target">{plan.fuelStrategy.raceTarget}</p>
-        <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 plan_fuel_rules" data-name="plan_fuel_rules">
-          {plan.fuelStrategy.rules.map(rule => (
-            <li key={rule} className="text-xs text-txt-secondary plan_fuel_rule" data-name="plan_fuel_rule">• {rule}</li>
-          ))}
-        </ul>
-      </div>
-
-      {/* Stratégie jour J */}
-      <div className="card mb-6 plan_race_card" data-name="plan_race_card">
-        <h3 className="flex items-center gap-1.5 text-sm font-medium text-txt-secondary mb-3 plan_race_title" data-name="plan_race_title">
-          <Flag size={14} /> Stratégie jour J — {fmtRaceDate(plan.raceDay)}
-        </h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 plan_race_segments" data-name="plan_race_segments">
-          {plan.raceStrategy.map(seg => (
-            <div key={seg.segment} className="px-3 py-2.5 rounded-lg bg-surface-muted plan_race_segment" data-name="plan_race_segment">
-              <div className="text-[11px] font-medium text-txt-muted plan_race_segment_label" data-name="plan_race_segment_label">{seg.segment}</div>
-              <div className="text-sm font-mono font-semibold text-txt plan_race_segment_pace" data-name="plan_race_segment_pace">{seg.pace}</div>
-              {seg.hrPct && (
-                <div className="text-[11px] font-mono text-txt-secondary plan_race_segment_hr" data-name="plan_race_segment_hr">
-                  {fmtHrRange(seg.hrPct[0], seg.hrPct[1], maxHr)}
-                </div>
-              )}
-              <div className="text-[11px] text-txt-secondary mt-1 plan_race_segment_detail" data-name="plan_race_segment_detail">{seg.detail}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
       {/* Semaines */}
       <div className="flex items-center gap-1.5 text-sm font-medium text-txt-secondary mb-3 plan_weeks_title" data-name="plan_weeks_title">
         <CalendarDays size={14} /> Les {plan.weeks.length} semaines du plan
       </div>
       <div className="space-y-3 plan_weeks_list" data-name="plan_weeks_list">
-        {plan.weeks.map(week => <WeekCard key={week.start} week={week} maxHr={maxHr} />)}
+        {plan.weeks.map(week => (
+          <WeekCard key={week.start} week={week} maxHr={maxHr} />
+        ))}
       </div>
 
       <p className="mt-4 text-[11px] text-txt-muted plan_footer_note" data-name="plan_footer_note">

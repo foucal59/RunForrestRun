@@ -42,7 +42,8 @@ venv/
 # ── Donnees personnelles du coureur ──────────────────────────────────────────
 # Ces fichiers contiennent des donnees d'entrainement identifiantes (records,
 # frequence cardiaque, historique de runs, plan nominatif). Ils restent locaux :
-# ne les committez pas. Voir coach_profile.example.json pour le format.
+# ne les committez pas. Voir runner_profile.example.json pour le format.
+runner_profile.json
 coach_profile.json
 public/coach-journal.json
 coach-journal*.json

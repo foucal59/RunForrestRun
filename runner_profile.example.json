@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Copie ce fichier en runner_profile.json et renseigne ce que tu veux imposer.",
+    "TOUT est optionnel : sans ce fichier, le plan se calibre seul sur les records",
+    "que la synchronisation Garmin ecrit dans .runtime/runner-profile.json.",
+    "Ce fichier est ignore par Git. Chaque cle a son equivalent en variable",
+    "d'environnement (voir .env.example) pour un deploiement Vercel."
+  ],
+
+  "raceName": "Marathon",
+  "raceDate": "2027-04-11",
+  "planWeeks": 15,
+  "taperWeeks": 3,
+
+  "_comment_goal": [
+    "goalTime prime sur tout. Laisse-le vide pour que l'objectif soit projete",
+    "depuis ton meilleur record (Riegel, avec une marge de conversion)."
+  ],
+  "goalTime": "",
+
+  "_comment_records": [
+    "Records connus, au format h:mm:ss ou mm:ss. Inutile de les saisir si tu",
+    "connectes Garmin : ils sont relus dans la base a chaque synchronisation.",
+    "Une valeur ici prime sur ce qui est observe."
+  ],
+  "records": {
+    "5k": "",
+    "10k": "",
+    "semi": "",
+    "marathon": ""
+  },
+
+  "_comment_hr": "Vide = la FC max reellement atteinte sur 90 jours est utilisee.",
+  "maxHr": null,
+
+  "_comment_frame": "Jours de la semaine : 0 = lundi, 6 = dimanche.",
+  "longRunWeekday": 5,
+  "qualityWeekday": 1,
+  "restWeekday": 0,
+
+  "_comment_volume": [
+    "Bornes de la rampe de sortie longue, en km. Ce sont les deux nombres qui",
+    "pilotent tout le volume : decharges, affutage et dose d'allure marathon",
+    "s'en deduisent."
+  ],
+  "longStartKm": 16,
+  "longPeakKm": 30,
+  "longAmStartKm": 6,
+  "longAmPeakKm": 18,
+
+  "_comment_name": "Nom imprime sur le PDF du plan. Laisse vide pour l'omettre.",
+  "runnerName": ""
+}

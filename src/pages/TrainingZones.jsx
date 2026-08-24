@@ -28,7 +28,8 @@ export default function TrainingZones() {
   const now = useNow()
   const [period, setPeriod] = useState(90)
 
-  // Current FC max: 90-day auto or manual override
+  // FC max used here: browser-local override, observed maximum over 90 days,
+  // then the personal fallback when no usable activity exists.
   const maxHr = useMemo(() => getCurrentMaxHr(activities), [activities, now])
 
   const zones = useMemo(() => buildZones(null, maxHr), [maxHr])
@@ -108,7 +109,7 @@ export default function TrainingZones() {
 
       {/* Summary Stats */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 sm:gap-4 mb-6 sm:mb-8 training_zones_stats_grid" data-name="training_zones_stats_grid">
-        <StatCard label="FC max estimee" value={maxHr} unit="bpm" name="training_zones_stat_max_hr" />
+        <StatCard label="FC max utilisée" value={maxHr} unit="bpm" name="training_zones_stat_max_hr" />
         <StatCard label="Aerobic" value={distribution.aerobic} unit="%" name="training_zones_stat_aerobic" />
         <StatCard label="Anaerobic" value={distribution.anaerobic} unit="%" name="training_zones_stat_anaerobic" />
         <StatCard label="Temps total" value={Math.round(distribution.totalMinutes / 60)} unit="h" name="training_zones_stat_total_time" />

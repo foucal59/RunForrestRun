@@ -67,11 +67,25 @@ export function fmtPace(seconds) {
 const TARGET_DIST = { '5k': 5000, '10k': 10000, 'semi': 21097.5, 'marathon': 42195 }
 const DISTANCE_LABELS = { '5k': '5 km', '10k': '10 km', semi: 'Semi-marathon', marathon: 'Marathon' }
 const RIEGEL_TARGETS = ['10k', 'semi', 'marathon']
+const RIEGEL_SOURCES = ['5k', '10k', 'semi', 'marathon']
+const RIEGEL_EXPONENT = 1.06
 // Source unique pour toutes les projections : le meilleur effort RÉCENT
-// (fenêtre 90 j), en préférant les distances longues — un vieux record de
-// 5 km ne reflète plus la forme du moment (ex: projection 10 km plus lente
-// que le 10 km réellement couru).
-const RIEGEL_SOURCE_ORDER = ['semi', '10k', 'marathon', '5k']
+// (fenêtre 90 j), choisi sur sa VALEUR et non sur sa distance.
+//
+// Préférer la plus longue distance disponible (l'ancien ordre
+// semi > 10 km > marathon > 5 km) suppose que le plus long effort récent est
+// une course. C'est faux dès qu'on court des sorties longues : le « semi » y
+// est un simple split de 21,1 km à allure d'endurance. Il écrasait alors un
+// vrai 10 km de course et projetait un 10 km plusieurs minutes plus lent que
+// celui réellement couru — exactement le symptôme que l'ordre par distance
+// devait corriger.
+//
+// Riegel s'écrit t2 = t1 · (d2/d1)^1,06, donc t2 = (t1 / d1^1,06) · d2^1,06 :
+// un effort se résume à l'indice t / d^1,06, et le classement des sources est
+// le MÊME pour toutes les distances cibles. On prend l'indice le plus bas —
+// le meilleur effort relatif. Comme le record de la cible est lui-même
+// candidat, une projection ne peut jamais être plus lente que le chrono déjà
+// couru sur cette distance.
 const RIEGEL_RECENT_WINDOW_DAYS = 90
 
 // Effort names mapped to our distance types
@@ -112,7 +126,14 @@ function estimateTime(movingTime, actualDist, type) {
 }
 
 export function riegel(t1, d1, d2) {
-  return t1 * Math.pow(d2 / d1, 1.06)
+  return t1 * Math.pow(d2 / d1, RIEGEL_EXPONENT)
+}
+
+// Valeur d'un effort, indépendante de la distance cible (voir RIEGEL_SOURCES).
+// Plus l'indice est bas, plus l'effort est fort.
+export function riegelFitnessIndex(timeS, distM) {
+  if (!(timeS > 0) || !(distM > 0)) return Infinity
+  return timeS / Math.pow(distM, RIEGEL_EXPONENT)
 }
 
 export function paceForDist(timeS, distType) {
@@ -465,19 +486,24 @@ function bestRecentRecord(prs, distType, cutoff) {
   return records.find(r => r?.time > 0 && r?.date && parseDate(r.date) >= cutoff) || null
 }
 
+// Meilleur effort au sens de l'indice Riegel, sur la fenêtre demandée.
+function strongestRiegelSource(prs, cutoff) {
+  let best = null
+  for (const source of RIEGEL_SOURCES) {
+    const dist = TARGET_DIST[source]
+    const record = cutoff ? bestRecentRecord(prs, source, cutoff) : bestRecord(prs, source)
+    if (!dist || !(record?.time > 0)) continue
+    const index = riegelFitnessIndex(record.time, dist)
+    if (!best || index < best.index) best = { source, record, index, recent: Boolean(cutoff) }
+  }
+  return best
+}
+
 function preferredRiegelSource(prs) {
   const cutoff = new Date(getNow() - RIEGEL_RECENT_WINDOW_DAYS * 86400000)
-  for (const source of RIEGEL_SOURCE_ORDER) {
-    const record = bestRecentRecord(prs, source, cutoff)
-    if (record && TARGET_DIST[source]) return { source, record, recent: true }
-  }
   // Aucun effort dans la fenêtre (coupure, blessure…) : retomber sur le
   // meilleur all-time plutôt que de faire disparaître les projections.
-  for (const source of RIEGEL_SOURCE_ORDER) {
-    const record = bestRecord(prs, source)
-    if (record?.time > 0 && TARGET_DIST[source]) return { source, record, recent: false }
-  }
-  return null
+  return strongestRiegelSource(prs, cutoff) || strongestRiegelSource(prs, null)
 }
 
 // Riegel projections for the race distances that matter for marathon planning.
@@ -486,7 +512,7 @@ function buildRiegelProjections(prs, { withSourceDate = false } = {}) {
   const picked = preferredRiegelSource(prs)
   if (!picked) return projections
   const { source, record: bestRec, recent } = picked
-  console.log(`[Riegel] source=${source} time=${bestRec.time}s date=${bestRec.date} recent=${recent} (fenêtre ${RIEGEL_RECENT_WINDOW_DAYS}j)`)
+  console.log(`[Riegel] source=${source} time=${bestRec.time}s date=${bestRec.date} recent=${recent} index=${picked.index?.toExponential(4)} (fenêtre ${RIEGEL_RECENT_WINDOW_DAYS}j, meilleur indice t/d^${RIEGEL_EXPONENT})`)
   RIEGEL_TARGETS.forEach(target => {
     const seconds = Math.round(riegel(bestRec.time, TARGET_DIST[source], TARGET_DIST[target]))
     const actual = bestRecord(prs, target)
@@ -531,7 +557,17 @@ function buildRiegelProjectionTimeline(prs) {
     const date = event.date.slice(0, 10)
     if (!timeline[date]) timeline[date] = {}
 
-    const source = RIEGEL_SOURCE_ORDER.find(sourceKey => runningBest[sourceKey]?.time > 0)
+    // Même règle que les projections courantes : le meilleur indice, pas la
+    // plus longue distance — sinon la courbe historique et le chiffre affiché
+    // racontent deux choses différentes.
+    let source = null
+    let bestIndex = Infinity
+    RIEGEL_SOURCES.forEach(sourceKey => {
+      const candidate = runningBest[sourceKey]
+      if (!(candidate?.time > 0)) return
+      const index = riegelFitnessIndex(candidate.time, TARGET_DIST[sourceKey])
+      if (index < bestIndex) { bestIndex = index; source = sourceKey }
+    })
     if (!source) return
     RIEGEL_TARGETS.forEach(target => {
       timeline[date][target] = Math.round(riegel(

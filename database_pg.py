@@ -272,12 +272,24 @@ _CREATE_TOMBSTONES_SQL = """CREATE TABLE IF NOT EXISTS sync_tombstones (
         PRIMARY KEY (entity_type, entity_id)
     )"""
 
+# Ajustements du plan decides par le coach. Le calendrier marathon vit dans le
+# code (daily_training_plan._build_calendar) : cette table est le seul canal par
+# lequel une decision du coach atteint le site sans redeploiement.
+_CREATE_PLAN_OVERRIDES_SQL = """CREATE TABLE IF NOT EXISTS plan_overrides (
+        day TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        note TEXT,
+        source TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )"""
+
 SMALL_TABLE_DDL = {
     "vo2max_history": _CREATE_VO2MAX_SQL,
     "sleep_history": _CREATE_SLEEP_SQL,
     "shoes": _CREATE_SHOES_SQL,
     "bikes": _CREATE_BIKES_SQL,
     "sync_meta": _CREATE_SYNC_META_SQL,
+    "plan_overrides": _CREATE_PLAN_OVERRIDES_SQL,
 }
 
 
@@ -311,6 +323,10 @@ RUN_METRIC_COLUMN_DEFINITIONS = {
         "water_estimated": "DOUBLE PRECISION",
         "garmin_workout_id": "BIGINT",
         "garmin_course_id": "BIGINT",
+        # typeKey Garmin brut ('running', 'trail_running', 'hiking', 'cycling'…).
+        # `type`/`sport_type` restent une catégorie grossière ('Run', 'Hike'…) sur
+        # laquelle filtre tout le site ; cette colonne porte la fidélité Garmin.
+        "garmin_type_key": "TEXT",
         "hr_time_in_zones": "JSONB",
         "power_time_in_zones": "JSONB",
         "garmin_fastest_splits": "JSONB",
@@ -366,6 +382,11 @@ RUN_METRIC_COLUMN_DEFINITIONS = {
         "corrected_altitude": "DOUBLE PRECISION",
         "uncorrected_altitude": "DOUBLE PRECISION",
         "garmin_metrics": "JSONB",
+    },
+    "activity_best_efforts": {
+        # Dénivelé net (m) sur la fenêtre du record : positif = ça monte.
+        # NULL = inconnu (ligne historique, ou run sans stream d'altitude).
+        "elevation_delta": "DOUBLE PRECISION",
     },
     "activity_laps": {
         "elevation_loss": "DOUBLE PRECISION",
@@ -461,6 +482,7 @@ def init_db_migrations():
     cur.execute(_CREATE_SHOES_SQL)
     cur.execute(_CREATE_BIKES_SQL)
     cur.execute(_CREATE_TOMBSTONES_SQL)
+    cur.execute(_CREATE_PLAN_OVERRIDES_SQL)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_laps_activity_id ON activity_laps (activity_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_splits_activity_id ON activity_splits (activity_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_best_efforts_activity_id ON activity_best_efforts (activity_id)")
@@ -473,7 +495,8 @@ def init_db_migrations():
         name TEXT,
         distance DOUBLE PRECISION,
         moving_time INTEGER,
-        elapsed_time INTEGER
+        elapsed_time INTEGER,
+        elevation_delta DOUBLE PRECISION
     )""")
 
     cur.execute("""
@@ -527,7 +550,7 @@ _ACTIVITY_COLUMNS = """
     body_battery_delta, steps, moderate_intensity_minutes,
     vigorous_intensity_minutes, min_temperature, max_temperature,
     avg_respiration_rate, min_respiration_rate, max_respiration_rate,
-    water_estimated, garmin_workout_id, garmin_course_id,
+    water_estimated, garmin_workout_id, garmin_course_id, garmin_type_key,
     hr_time_in_zones, power_time_in_zones, garmin_fastest_splits,
     health_snapshot_at, health_sleep_date, health_sleep_score,
     health_sleep_quality, health_sleep_duration_seconds,
@@ -809,6 +832,57 @@ def _dedupe_recent_plan_runs(runs: list[dict]) -> list[dict]:
     return _dedupe_records(runs, _merge_recent_plan_runs)
 
 
+def attach_plan_run_structure(runs: list[dict]) -> list[dict]:
+    """Attache les laps aux runs lus par le planificateur.
+
+    Les moyennes d'une activite ne voient pas un fractionne courru en montagne
+    (allure moyenne lente, FC moyenne basse) : les laps, elles, gardent
+    l'alternance effort/recup qui signe la seance. Lecture best-effort — une
+    table indisponible ne doit pas casser le plan.
+    """
+    ids = [int(run["id"]) for run in runs if run.get("id") is not None]
+    if not ids:
+        return runs
+    try:
+        conn = _safe_conn()
+        cur = conn.cursor()
+        placeholders = ", ".join(["%s"] * len(ids))
+        cur.execute(f"""
+            SELECT activity_id, lap_index, moving_time, elapsed_time, distance,
+                   average_heartrate, max_heartrate
+            FROM activity_laps
+            WHERE activity_id IN ({placeholders})
+            ORDER BY activity_id, lap_index
+        """, ids)
+        by_activity: dict[int, list[dict]] = {}
+        for row in cur.fetchall():
+            by_activity.setdefault(int(row[0]), []).append({
+                "lap_index": int(row[1] or 0),
+                "moving_time": int(row[2] or 0) or int(row[3] or 0),
+                "distance_m": float(row[4] or 0),
+                "average_heartrate": float(row[5]) if row[5] is not None else None,
+                "max_heartrate": float(row[6]) if row[6] is not None else None,
+            })
+    except Exception as e:
+        print(f"[DB] attach_plan_run_structure failed: {type(e).__name__}: {e}", file=sys.stderr)
+        try:
+            _safe_conn().rollback()
+        except Exception:
+            pass
+        return runs
+
+    for run in runs:
+        laps = by_activity.get(int(run["id"])) if run.get("id") is not None else None
+        if laps:
+            run["laps"] = laps
+    print(
+        f"[plan-structure] laps attachees sur "
+        f"{sum(1 for run in runs if run.get('laps'))}/{len(runs)} runs",
+        file=sys.stderr,
+    )
+    return runs
+
+
 def get_all_activities() -> list:
     """Return all Run activities as flat dicts (unbounded range query)."""
     return get_activities_range()
@@ -898,11 +972,16 @@ def get_latest_activity_date() -> str | None:
 
 
 def get_all_activity_ids() -> set:
-    """All Run activity IDs as a set (id-only, lightweight). Used for dedup when
-    the freshness probe pulls recent runs from Strava."""
+    """All activity IDs as a set (id-only, lightweight). Used for dedup when the
+    freshness probe pulls recent activities from Garmin/Strava.
+
+    Volontairement NON filtré sur type='Run' : la base stocke aussi les randos,
+    vélos, ski… (fidélité Garmin). Filtrer ici les rendrait invisibles au dédoublon,
+    donc « nouvelles » à chaque cycle — re-upsert et compteur `added` faussé à vie.
+    """
     conn = _safe_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM activities WHERE type = 'Run'")
+    cur.execute("SELECT id FROM activities")
     return {row[0] for row in cur.fetchall()}
 
 
@@ -932,6 +1011,36 @@ def get_activity_tombstone_ids() -> set[str]:
         return set()
 
 
+def get_known_device_ids() -> set[int]:
+    """Appareils Garmin qui ont déjà alimenté la base sans être rejetés.
+
+    Sert de filet au filtre d'ingestion : Garmin fait tourner l'identifiant
+    interne d'une même montre — Garmin la renumérote à chaque réappairage,
+    plusieurs fois par an — donc s'en remettre au seul
+    `get_devices()` du moment ferait rejeter des courses légitimes le jour où
+    l'identifiant change encore. Un appareil déjà présent en base a été accepté
+    une fois, il reste digne de confiance.
+    """
+    conn = _safe_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT DISTINCT garmin_device_id FROM activities "
+            "WHERE garmin_device_id IS NOT NULL AND garmin_device_id > 0"
+        )
+        return {int(row[0]) for row in cur.fetchall() if row[0] is not None}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(
+            f"[DB] get_known_device_ids unavailable: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return set()
+
+
 def get_garmin_run_ids() -> set[int]:
     """Garmin activity ids that are already linked to canonical Run rows."""
     conn = _safe_conn()
@@ -945,17 +1054,52 @@ def get_garmin_run_ids() -> set[int]:
 
 
 def get_activities_start_dates_since(since_iso: str) -> list[dict]:
-    """Return [{start_date_local, distance}] for Run activities after since_iso.
-    Used by garmin_freshness to deduplicate against existing Strava activities."""
+    """Return [{start_date_local, distance, type}] for activities after since_iso.
+
+    Sert au dédoublon dans garmin_freshness, qui a besoin des deux familles :
+    `type='Run'` pour la déduplication Strava/Garmin d'une même course, le reste
+    pour reconnaître une sortie enregistrée deux fois par Garmin (montre
+    « Randonnée » + téléphone « Marche à pied »). D'où l'absence de filtre ici.
+    """
     conn = _safe_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT start_date_local, distance FROM activities
-        WHERE type = 'Run' AND start_date_local >= %s
+        SELECT start_date_local, distance, type FROM activities
+        WHERE start_date_local >= %s
         ORDER BY start_date_local DESC
         LIMIT 300
     """, [since_iso])
-    return [{"start_date_local": str(r[0]), "distance": r[1]} for r in cur.fetchall()]
+    return [
+        {"start_date_local": str(r[0]), "distance": r[1], "type": r[2]}
+        for r in cur.fetchall()
+    ]
+
+
+def get_cross_training_activities() -> list[dict]:
+    """Toutes les activités hors course (rando, vélo, ski, muscu…).
+
+    Le site ne s'en sert jamais — il ne lit que `type = 'Run'`. Sert au
+    rattrapage des doublons (scripts/dedupe_cross_training.py) et à tout outil
+    qui veut la charge non-course.
+    """
+    conn = _safe_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, type, garmin_type_key, name, start_date_local, distance,
+               moving_time, elapsed_time, total_elevation_gain
+        FROM activities
+        WHERE type <> 'Run'
+        ORDER BY start_date_local DESC
+    """)
+    cols = [desc[0] for desc in cur.description]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.rollback()
+    for row in rows:
+        row["start_date_local"] = _iso_notz(row["start_date_local"]) if row["start_date_local"] else ""
+        row["distance"] = float(row["distance"] or 0)
+        row["moving_time"] = int(row["moving_time"] or 0)
+        row["elapsed_time"] = int(row["elapsed_time"] or 0)
+    return rows
 
 
 def _extract_latlng(a, key):
@@ -1431,7 +1575,7 @@ _ACTIVITIES_UPSERT_SQL = """
         INSERT INTO activities (id, athlete_id, name, start_date_local, distance,
             moving_time, elapsed_time, total_elevation_gain, average_speed, max_speed,
             average_heartrate, max_heartrate, map_summary_polyline, gear_id,
-            sport_type, type, start_lat, start_lng, end_lat, end_lng,
+            sport_type, type, garmin_type_key, start_lat, start_lng, end_lat, end_lng,
             pr_count, suffer_score, calories, has_heartrate, average_cadence,
             source, garmin_activity_id, updated_at)
         VALUES {values}
@@ -1449,6 +1593,7 @@ _ACTIVITIES_UPSERT_SQL = """
             gear_id = EXCLUDED.gear_id,
             sport_type = EXCLUDED.sport_type,
             type = EXCLUDED.type,
+            garmin_type_key = COALESCE(EXCLUDED.garmin_type_key, activities.garmin_type_key),
             start_lat = COALESCE(EXCLUDED.start_lat, activities.start_lat),
             start_lng = COALESCE(EXCLUDED.start_lng, activities.start_lng),
             end_lat = COALESCE(EXCLUDED.end_lat, activities.end_lat),
@@ -1505,6 +1650,7 @@ def upsert_activities(activities: list):
             _safe_int(a.get("max_heartrate")),
             a.get("summary_polyline") or (a.get("map") or {}).get("summary_polyline", ""),
             a.get("gear_id"), a.get("sport_type", "Run"), a.get("type", "Run"),
+            a.get("garmin_type_key"),
             _safe_float(slat), _safe_float(slng), _safe_float(elat), _safe_float(elng),
             _safe_int(a.get("pr_count", 0)),
             _safe_int(a.get("suffer_score")),
@@ -1534,16 +1680,18 @@ def upsert_activities(activities: list):
 
 # ── Computed Best Times (from activity_best_efforts table) ──
 
-# Map effort names to our distance types
-EFFORT_NAME_MAP = {
-    "5K": "5k",
-    "10K": "10k",
-    "Half-Marathon": "semi",
-    "Marathon": "marathon",
-    "15K": "15k",
-    "20K": "20k",
-    "30K": "30k",
-}
+# Le seuil de pente et la table des distances vivent dans best_effort_rules, qui
+# n'importe rien : le profil du coach (scripts/coach_journal.py) doit appliquer
+# exactement la meme regle que la lecture ci-dessous, sans tirer pg8000 pour ca.
+# Reexportes ici pour que db.MAX_NET_DROP_PER_KM et les imports existants
+# continuent de fonctionner tels quels.
+from best_effort_rules import (  # noqa: E402  (constantes reexportees)
+    COMPUTED_EFFORT_NAMES,
+    EFFORT_NAME_MAP,
+    EFFORT_TARGET_METERS,
+    MAX_NET_DROP_PER_KM,
+    is_downhill_assisted,
+)
 
 def get_computed_bests(distance_type: str) -> list:
     """Get best efforts for a single distance type (thin wrapper on the bulk query)."""
@@ -1570,10 +1718,15 @@ def get_computed_bests_bulk(distance_types: list) -> dict:
         cur.execute(f"""
             SELECT be.name, be.activity_id, be.moving_time, be.elapsed_time, be.distance,
                    a.start_date_local, a.name, a.distance AS activity_distance,
-                   a.moving_time AS activity_moving_time
+                   a.moving_time AS activity_moving_time, be.elevation_delta
             FROM activity_best_efforts be
             JOIN activities a ON a.id = be.activity_id
             WHERE be.name IN ({placeholders})
+              AND a.type = 'Run'
+              AND (
+                be.elevation_delta IS NULL
+                OR be.elevation_delta >= 0 - {MAX_NET_DROP_PER_KM} * (COALESCE(be.distance, 0) / 1000.0)
+              )
             ORDER BY be.moving_time ASC
         """, list(wanted.keys()))
         for row in cur.fetchall():
@@ -1585,6 +1738,7 @@ def get_computed_bests_bulk(distance_types: list) -> dict:
                 "name": row[6] or "",
                 "distance": row[7] or 0,
                 "movingTime": row[8] or 0,
+                "elevationDelta": row[9],
             })
         conn.rollback()
         return results
@@ -1598,6 +1752,27 @@ def get_computed_bests_bulk(distance_types: list) -> dict:
 
 
 # ── Activity Details (from activity_splits + activity_best_efforts) ──
+
+def _ensure_best_effort_elevation_column(cur) -> None:
+    """Guarantee activity_best_efforts.elevation_delta before writing efforts.
+
+    Appelé sur la primaire ET dans la closure de réplication : la secondaire ne
+    passe pas par init_db_migrations(), et un INSERT sur une colonne absente
+    ouvrirait le disjoncteur de _replicate() à chaque run enrichi.
+    """
+    cur.execute("""
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'activity_best_efforts'
+          AND column_name = 'elevation_delta'
+    """)
+    if cur.fetchone():
+        return
+    cur.execute(
+        "ALTER TABLE activity_best_efforts ADD COLUMN elevation_delta DOUBLE PRECISION"
+    )
+
 
 def _ensure_activity_splits_id_default(cur) -> None:
     """Repair and advance the split-id sequence before inserting split rows.
@@ -1635,15 +1810,26 @@ def _ensure_activity_splits_id_default(cur) -> None:
 
 
 def upsert_activity_details(activity_id: int, splits: list, best_efforts: list, distance: float = 0,
-                            mark_fetched: bool = True, replace_splits: bool = False):
+                            mark_fetched: bool = True, replace_splits: bool = False,
+                            replace_efforts: bool = False):
     """Store splits and best efforts into normalized tables.
 
     mark_fetched=False leaves details_fetched_at untouched so the activity can
     be re-fetched later (Garmin returns empty details right after an upload).
     replace_splits=True drops existing metric splits first, so a richer
     re-fetch (stream-derived km splits) overwrites coarse lap-derived ones.
+    replace_efforts=True drops the recomputed distances first : un upsert seul
+    ne peut pas *retirer* un effort devenu inéligible (fenêtre trop descendante),
+    puisqu'il n'écrit que les lignes qu'on lui donne.
     """
     delete_splits_sql = "DELETE FROM activity_splits WHERE activity_id = %s AND split_type = 'metric'"
+    # Ne purge que les distances qu'on sait recalculer : un import Strava
+    # historique peut porter d'autres noms (15K, 20K, 30K) qu'on ne refait pas.
+    delete_efforts_sql = (
+        "DELETE FROM activity_best_efforts WHERE activity_id = %s AND name IN ("
+        + ",".join(["%s"] * len(COMPUTED_EFFORT_NAMES)) + ")"
+    )
+    delete_efforts_params = [activity_id, *COMPUTED_EFFORT_NAMES]
     split_sql = """
             INSERT INTO activity_splits (activity_id, split_index, split_type, distance,
                 elapsed_time, moving_time, average_speed)
@@ -1655,11 +1841,13 @@ def upsert_activity_details(activity_id: int, splits: list, best_efforts: list, 
                 average_speed = EXCLUDED.average_speed
     """
     effort_sql = """
-            INSERT INTO activity_best_efforts (id, activity_id, name, distance, moving_time, elapsed_time)
+            INSERT INTO activity_best_efforts (id, activity_id, name, distance, moving_time,
+                elapsed_time, elevation_delta)
             VALUES {values}
             ON CONFLICT (id) DO UPDATE SET
                 moving_time = EXCLUDED.moving_time,
-                elapsed_time = EXCLUDED.elapsed_time
+                elapsed_time = EXCLUDED.elapsed_time,
+                elevation_delta = EXCLUDED.elevation_delta
     """
     complete_status = _primary_complete_status()
     metrics_version = _run_metrics_version()
@@ -1688,6 +1876,7 @@ def upsert_activity_details(activity_id: int, splits: list, best_efforts: list, 
         effort_rows.append([
             eid, activity_id, e.get("name", ""), e.get("distance", 0),
             e.get("moving_time", 0), e.get("elapsed_time", 0),
+            e.get("elevation_delta"),
         ])
     do_replace = replace_splits and bool(split_rows)
     conn = _safe_conn()
@@ -1698,11 +1887,15 @@ def upsert_activity_details(activity_id: int, splits: list, best_efforts: list, 
         cur.execute(delete_splits_sql, [activity_id])
     if split_rows:
         _executemany_values(cur, split_sql, split_rows)
+    if replace_efforts:
+        _ensure_best_effort_elevation_column(cur)
+        cur.execute(delete_efforts_sql, delete_efforts_params)
     if effort_rows:
+        _ensure_best_effort_elevation_column(cur)
         _executemany_values(cur, effort_sql, effort_rows)
     if mark_fetched:
         cur.execute(mark_sql, [complete_status, activity_id])
-    if split_rows or effort_rows:
+    if split_rows or effort_rows or replace_efforts:
         cur.execute(
             _mark_run_component_sql("details"),
             [metrics_version, metrics_version, activity_id],
@@ -1717,11 +1910,15 @@ def upsert_activity_details(activity_id: int, splits: list, best_efforts: list, 
             c.execute(delete_splits_sql, [activity_id])
         if split_rows:
             _executemany_values(c, split_sql, split_rows)
+        if replace_efforts:
+            _ensure_best_effort_elevation_column(c)
+            c.execute(delete_efforts_sql, delete_efforts_params)
         if effort_rows:
+            _ensure_best_effort_elevation_column(c)
             _executemany_values(c, effort_sql, effort_rows)
         if mark_fetched:
             c.execute(mark_sql, [complete_status, activity_id])
-        if split_rows or effort_rows:
+        if split_rows or effort_rows or replace_efforts:
             c.execute(
                 _mark_run_component_sql("details"),
                 [metrics_version, metrics_version, activity_id],
@@ -1999,7 +2196,9 @@ def get_all_gears() -> list:
     cur = conn.cursor()
     cur.execute("""
         SELECT id, name, nickname, brand_name, model_name, distance,
-               primary_shoe AS primary, retired
+               -- "primary" est un mot reserve : sans guillemets, SQLite refuse
+               -- la requete et /api/data/shoes renvoie 500 en mode dev.
+               primary_shoe AS "primary", retired
         FROM shoes
         ORDER BY distance DESC
     """)
@@ -2492,6 +2691,96 @@ def set_sync_meta(key: str, value):
     _replicate(f"set_sync_meta[{key}]", _repl)
 
 
+# ── Ajustements du plan (coach) ──
+
+def get_plan_overrides() -> dict:
+    """Ajustements du coach, indexes par jour ISO.
+
+    Lecture best-effort : si la table n'existe pas encore (migration pas passee)
+    ou si la base est indisponible, le plan code en dur reste affiche tel quel.
+    """
+    # Lu a chaque chargement du plan : on tente le SELECT seul, sans DDL, pour ne
+    # pas payer un aller-retour de migration par requete. La table est creee par
+    # init_db_migrations ; le rattrapage ci-dessous ne sert qu'au premier passage.
+    try:
+        conn = _safe_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT day, payload, note, source FROM plan_overrides ORDER BY day")
+        rows = cur.fetchall()
+    except Exception as e:
+        print(f"[DB] get_plan_overrides failed: {type(e).__name__}: {e}", file=sys.stderr)
+        try:
+            if getattr(_local, "conn", None) is not None:
+                _local.conn.rollback()
+            conn = _safe_conn()
+            cur = conn.cursor()
+            cur.execute(_CREATE_PLAN_OVERRIDES_SQL)
+            conn.commit()
+        except Exception as create_err:
+            print(
+                f"[DB] plan_overrides create failed: {type(create_err).__name__}: {create_err}",
+                file=sys.stderr,
+            )
+        return {}
+
+    overrides = {}
+    for day, payload, note, source in rows:
+        try:
+            session = json.loads(payload)
+        except (TypeError, ValueError):
+            print(f"[DB] plan_overrides[{day}] payload illisible, ignore", file=sys.stderr)
+            continue
+        if not isinstance(session, dict):
+            continue
+        overrides[str(day)[:10]] = {"session": session, "note": note, "source": source}
+    return overrides
+
+
+def upsert_plan_override(day: str, session: dict, note: str = "", source: str = "coach"):
+    """Enregistre l'ajustement du coach pour un jour. Replique vers la 2e base."""
+    day_iso = str(day)[:10]
+    payload = json.dumps(session)
+    upsert_sql = """
+        INSERT INTO plan_overrides (day, payload, note, source, updated_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (day) DO UPDATE SET
+            payload = EXCLUDED.payload,
+            note = EXCLUDED.note,
+            source = EXCLUDED.source,
+            updated_at = NOW()
+    """
+    params = [day_iso, payload, note or None, source or None]
+    conn = _safe_conn()
+    cur = conn.cursor()
+    cur.execute(_CREATE_PLAN_OVERRIDES_SQL)
+    cur.execute(upsert_sql, params)
+    conn.commit()
+
+    def _repl(c):
+        c.execute(_CREATE_PLAN_OVERRIDES_SQL)
+        c.execute(upsert_sql, params)
+    _replicate(f"upsert_plan_override[{day_iso}]", _repl)
+    return day_iso
+
+
+def delete_plan_override(day: str) -> bool:
+    """Supprime l'ajustement d'un jour (retour au plan code en dur)."""
+    day_iso = str(day)[:10]
+    delete_sql = "DELETE FROM plan_overrides WHERE day = %s"
+    conn = _safe_conn()
+    cur = conn.cursor()
+    cur.execute(_CREATE_PLAN_OVERRIDES_SQL)
+    cur.execute(delete_sql, [day_iso])
+    removed = cur.rowcount > 0
+    conn.commit()
+
+    def _repl(c):
+        c.execute(_CREATE_PLAN_OVERRIDES_SQL)
+        c.execute(delete_sql, [day_iso])
+    _replicate(f"delete_plan_override[{day_iso}]", _repl)
+    return removed
+
+
 def upsert_vo2max(date: str, value):
     """Store one VO2max point (date = 'YYYY-MM-DD'). Replicated to the secondary DB."""
     if value is None:
@@ -2604,7 +2893,7 @@ def get_recent_runs_for_plan(target_date: str, days: int = 3) -> list:
                     "average_heartrate": float(row[5]) if row[5] is not None else None,
                     "max_heartrate": float(row[6]) if row[6] is not None else None,
                 })
-            return _dedupe_recent_plan_runs(runs)
+            return attach_plan_run_structure(_dedupe_recent_plan_runs(runs))
         except Exception as e:
             print(f"[DB] get_recent_runs_for_plan failed ({attempt + 1}/2): {type(e).__name__}: {e}", file=sys.stderr)
             try:

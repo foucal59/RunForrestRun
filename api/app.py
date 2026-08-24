@@ -24,13 +24,16 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import db
+from database_convergence import synchronize_available_databases
 from coach_mcp import create_http_app as create_coach_mcp_http_app
 from coach_mcp import load_snapshot as load_coach_snapshot
+from compat_api_logging import log_compatibility_api_usage
 from daily_training_plan import (
     build_plan_overview,
     build_three_day_training_guidance,
     build_workout_export,
     normalize_recent_training_runs,
+    set_plan_overrides,
 )
 from workout_builder import build_garmin_workout, is_workout_eligible
 from posthog_client import get_client as _ph
@@ -150,7 +153,7 @@ def _bearer_token(request: Request) -> str:
 async def require_session_for_private_data(request: Request, call_next):
     """Keep personal DB reads private and prevent anonymous Neon egress."""
     path = request.url.path
-    if (path.startswith("/api/mcp") or path == "/api/coach/journal") and request.method != "OPTIONS":
+    if path.startswith("/api/mcp") and request.method != "OPTIONS":
         if not MCP_AUTH_TOKEN:
             if os.environ.get("VERCEL"):
                 return JSONResponse({"detail": "MCP_AUTH_TOKEN not configured"}, status_code=503)
@@ -163,6 +166,12 @@ async def require_session_for_private_data(request: Request, call_next):
     if (path.startswith("/api/data/") or path == "/api/streams") and not get_session(request):
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def log_compatibility_routes(request: Request, call_next):
+    """Measure legacy API usage before deciding whether routes can be removed."""
+    return await log_compatibility_api_usage(request, call_next)
 
 
 @app.exception_handler(Exception)
@@ -395,10 +404,29 @@ async def data_training_status(request: Request):
     return ts
 
 
+def _apply_coach_plan_overrides() -> dict:
+    """Pose les ajustements du coach avant tout calcul de plan.
+
+    Le calendrier marathon est fige dans le code : sans ce chargement, une
+    decision du coach (table plan_overrides) resterait invisible sur le site.
+    Lecture best-effort — une base indisponible ne doit pas casser le plan.
+    """
+    try:
+        overrides = db.get_plan_overrides()
+    except Exception as e:
+        print(f"[plan-overrides] lecture impossible: {type(e).__name__}: {e}", file=sys.stderr)
+        overrides = {}
+    set_plan_overrides(overrides)
+    if overrides:
+        print(f"[plan-overrides] {len(overrides)} ajustement(s) coach appliques", file=sys.stderr)
+    return overrides
+
+
 @app.get("/api/data/daily-training")
 async def data_daily_training(request: Request, day: str = ""):
     """Adaptive marathon guidance for today and the next seven days."""
     target_day = (day or date.today().isoformat())[:10]
+    _apply_coach_plan_overrides()
     recent_runs = db.get_recent_runs_for_plan(target_day, days=90)[:10]
     latest_sleep = db.get_latest_sleep_score(target_day)
     return build_three_day_training_guidance(target_day, recent_runs, latest_sleep)
@@ -415,6 +443,7 @@ async def data_daily_training_from_recent_runs(request: Request):
         payload = {}
 
     target_day = str(payload.get("day") or date.today().isoformat())[:10]
+    _apply_coach_plan_overrides()
     recent_runs = normalize_recent_training_runs(
         payload.get("recentRuns") or payload.get("recent_runs") or [],
         target_day,
@@ -429,9 +458,15 @@ async def data_daily_training_from_recent_runs(request: Request):
 async def data_plan_overview(request: Request, day: str = ""):
     """Full marathon plan, week by week, with detailed session targets."""
     target_day = (day or date.today().isoformat())[:10]
-    overview = build_plan_overview(target_day)
+    _apply_coach_plan_overrides()
+    # La page Plan doit raconter la meme chose que le cockpit : le calendrier
+    # sert de structure, les runs reellement enregistres priment.
+    recent_runs = db.get_recent_runs_for_plan(target_day, days=90)[:10]
+    overview = build_plan_overview(target_day, recent_runs)
+    adjusted = sum(1 for w in overview["weeks"] for s in w["sessions"] if s["adjusted"])
     print(
-        f"[plan-overview] {len(overview['weeks'])} weeks, generated for {overview['generatedFor']}",
+        f"[plan-overview] {len(overview['weeks'])} weeks, generated for "
+        f"{overview['generatedFor']}, {adjusted} adjusted session(s)",
         file=sys.stderr,
     )
     return overview
@@ -492,6 +527,7 @@ async def data_workout_garmin(request: Request, day: str = ""):
         body = await request.json()
     except Exception:
         body = {}
+    _apply_coach_plan_overrides()
     export = _coerce_workout_export_payload(target_day, body) or build_workout_export(target_day)
     if export is None:
         raise HTTPException(404, "Pas de seance Garmin structuree pour ce jour.")
@@ -577,19 +613,33 @@ async def data_ready(request: Request):
 
 @app.post("/api/data/sync")
 async def data_sync(request: Request):
-    """No-op sync endpoint.
+    """Explicit UI sync: Garmin first, then every available run database."""
+    session = get_session(request)
+    if not session or not session.get("athlete"):
+        print("[data/sync] no session, skipping", file=sys.stderr)
+        return JSONResponse(
+            {"added": 0, "details_fetched": 0, "checked": False, "skipped": "no_session"},
+        )
 
-    The Neon DB is the single source of truth and is populated by an
-    out-of-band pipeline; this endpoint just reports current status so the
-    UI keeps working without needing to be rewired.
-    """
-    print("[data/sync] No-op (DB is source of truth)", file=sys.stderr)
-    status = db.get_sync_status()
-    return {
-        "results": {"noop": True, "reason": "db_is_source_of_truth"},
-        "status": status,
-        "rate_limited": False,
-    }
+    import garmin_freshness
+    try:
+        result = await asyncio.to_thread(
+            garmin_freshness.check_and_populate, GARMIN_TOKEN_DIR
+        )
+    except Exception as exc:
+        print(f"[data/sync] Garmin failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise HTTPException(500, detail=f"{type(exc).__name__}: {str(exc)[:300]}")
+
+    # The explicit button waits for convergence. This is deliberately separate
+    # from the lightweight on-open freshness endpoint below.
+    result["database_sync"] = await asyncio.to_thread(
+        synchronize_available_databases
+    )
+    print(f"[data/sync] databases={result['database_sync']}", file=sys.stderr)
+    if result.get("added", 0) > 0:
+        distinct_id = str(session["athlete"].get("id", "anonymous"))
+        _ph().capture(distinct_id, "garmin_sync_completed", {"activities_added": result["added"]})
+    return JSONResponse(result)
 
 
 @app.post("/api/data/freshness-check")
@@ -604,7 +654,9 @@ async def data_freshness_check(request: Request):
 
     import garmin_freshness
     try:
-        result = garmin_freshness.check_and_populate(token_dir=GARMIN_TOKEN_DIR)
+        result = await asyncio.to_thread(
+            garmin_freshness.check_and_populate, GARMIN_TOKEN_DIR
+        )
     except Exception as e:
         print(f"[freshness] unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
         raise HTTPException(500, detail=f"{type(e).__name__}: {str(e)[:300]}")
@@ -671,11 +723,13 @@ async def health():
     return {"status": "ok", "activities": db.get_activity_count()}
 
 
-# ── Coach snapshot privé, protégé par MCP_AUTH_TOKEN ──
+# ── Coach snapshot (public, read-only, no Neon) ──
+# Servi depuis un JSON statique régénéré chaque matin par scripts/coach_journal.py
+# et committé dans le repo (→ redeploy Vercel). Lu par le serveur MCP coach.
 
 @app.get("/api/coach/journal")
 async def coach_journal():
-    """Dernier snapshot coach, accessible uniquement avec un Bearer token."""
+    """Dernier snapshot coach (7 runs analysés + séance du jour + projection). Public, sans Neon."""
     try:
         return JSONResponse(load_coach_snapshot())
     except FileNotFoundError:

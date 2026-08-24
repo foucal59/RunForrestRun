@@ -1,12 +1,17 @@
 import React, { useMemo, useState, useCallback, useEffect, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Pencil, Check, X, RotateCcw, HeartPulse } from 'lucide-react'
+import { Pencil, Check, X, RotateCcw, FileText, Download, HeartPulse } from 'lucide-react'
 import posthog from 'posthog-js'
 import { useActivities } from '../contexts/ActivityContext'
 import { computeCockpit, parseLocalDate, fmtPace, localDateStr } from '../lib/compute'
 import { loadDailyTraining, peekDailyTraining, getActivityStreams, recentTrainingRunsFromActivities } from '../api'
 import { computeLoadDistribution } from '../lib/training'
-import { getCurrentMaxHr, getManualFcMax, setManualFcMax, getMaxHrForDate, getMaxHrWithDate } from '../lib/heartRateZones'
+import {
+  getCurrentMaxHrInfo,
+  setManualFcMax,
+  getObservedMaxHrWithDate,
+  OBSERVED_MAX_HR_WINDOW_DAYS,
+} from '../lib/heartRateZones'
 import { useNow } from '../lib/clock'
 import { isLikelyEncodedPolyline, toMapRun } from '../lib/runMaps'
 import StatCard from '../components/StatCard'
@@ -17,7 +22,6 @@ import PaceDistanceScatter from '../components/PaceDistanceScatter'
 import GarminWorkoutButton from '../components/GarminWorkoutButton'
 
 const RECENT_RUNS_LIMIT = 5
-const MAP_WINDOW_DAYS = 30
 
 function fmtHrRange(pctMin, pctMax, maxHr) {
   return `${Math.round(pctMin * maxHr)}-${Math.round(pctMax * maxHr)}`
@@ -233,7 +237,7 @@ export default function Cockpit() {
   const [fcMaxVersion, setFcMaxVersion] = useState(0)
   const [dailyTraining, setDailyTraining] = useState(null)
   const [dailyTrainingLoading, setDailyTrainingLoading] = useState(false)
-  const [mapWindowStreams, setMapWindowStreams] = useState({})
+  const [filteredMapStreams, setFilteredMapStreams] = useState({})
   const mountedRef = useRef(false)
 
   useEffect(() => {
@@ -276,14 +280,17 @@ export default function Cockpit() {
   }, [activities, computedPRs, now])
 
   // FC max must be computed first — load distribution depends on it.
-  const currentFcMax = useMemo(() => {
+  const currentFcMaxInfo = useMemo(() => {
     void fcMaxVersion
-    return getCurrentMaxHr(activities)
+    return getCurrentMaxHrInfo(activities)
   }, [activities, fcMaxVersion, now])
+  const currentFcMax = currentFcMaxInfo.hr
 
-  const autoFcMax = useMemo(() => getMaxHrForDate(activities, new Date(now), 90), [activities, now])
-  const autoFcMaxInfo = useMemo(() => getMaxHrWithDate(activities, new Date(now), 90), [activities, now])
-  const isOverridden = getManualFcMax() > 0
+  const observedFcMax90dInfo = useMemo(
+    () => getObservedMaxHrWithDate(activities, new Date(now), OBSERVED_MAX_HR_WINDOW_DAYS),
+    [activities, now]
+  )
+  const isOverridden = currentFcMaxInfo.source === 'manual_local'
 
   // Use the same FC max as the card to ensure consistent zone boundaries.
   const loadDist = useMemo(() => {
@@ -320,32 +327,28 @@ export default function Cockpit() {
 
   const recentRuns = useMemo(() => activities.slice(0, RECENT_RUNS_LIMIT), [activities])
   const recentRunIds = useMemo(() => recentRuns.map(activity => activity.id), [recentRuns])
-  const mapWindowRuns = useMemo(() => {
-    const since = now - MAP_WINDOW_DAYS * 86400000
-    return activities.filter(activity => parseLocalDate(activity.start_date_local).getTime() >= since)
-  }, [activities, now])
-  const mapWindowSignature = useMemo(
-    () => mapWindowRuns
+  const filteredMapSignature = useMemo(
+    () => activities
       .map(activity => [
         activity.id,
         activity.start_date_local || '',
         isLikelyEncodedPolyline(activity.summary_polyline) ? 'polyline' : 'streams',
       ].join(':'))
       .join('|'),
-    [mapWindowRuns]
+    [activities]
   )
 
   useEffect(() => {
-    if (!mapWindowRuns.length) return
+    if (!activities.length) return
 
-    const missing = mapWindowRuns.filter(activity => {
+    const missing = activities.filter(activity => {
       const id = String(activity.id)
       return !isLikelyEncodedPolyline(activity.summary_polyline) &&
-        !Object.prototype.hasOwnProperty.call(mapWindowStreams, id)
+        !Object.prototype.hasOwnProperty.call(filteredMapStreams, id)
     })
     if (!missing.length) return
 
-    setMapWindowStreams(prev => {
+    setFilteredMapStreams(prev => {
       const next = { ...prev }
       for (const activity of missing) {
         const id = String(activity.id)
@@ -368,25 +371,26 @@ export default function Cockpit() {
       }
     })).then(entries => {
       if (!mountedRef.current) return
-      setMapWindowStreams(prev => {
+      setFilteredMapStreams(prev => {
         const next = { ...prev }
         for (const [id, value] of entries) next[id] = value
         return next
       })
     })
-  }, [mapWindowSignature])
+  }, [filteredMapSignature])
 
-  // Map runs: show the last 30 days. Garmin activities usually
-  // have no encoded summary polyline, so their real GPS stream is loaded above.
+  // The map follows the global date filter through `activities`. Garmin
+  // activities usually have no encoded summary polyline, so their real GPS
+  // stream is loaded above.
   const mapRuns = useMemo(() => {
-    console.log('[Cockpit] preparing 30-day map runs from', mapWindowRuns.length, 'activities')
-    return mapWindowRuns
+    console.log('[Cockpit] preparing filtered map runs from', activities.length, 'activities')
+    return activities
       .map(activity => {
-        const cached = mapWindowStreams[String(activity.id)]
+        const cached = filteredMapStreams[String(activity.id)]
         return toMapRun(activity, [], cached?.points || null, { allowFallback: false })
       })
       .filter(Boolean)
-  }, [mapWindowRuns, mapWindowStreams])
+  }, [activities, filteredMapStreams])
 
   if (loading && !activities.length) return <Loader />
   if (!data && !activities.length) return <div className="text-txt-muted cockpit_empty_state" data-name="cockpit_empty_state">Aucune donnee disponible.</div>
@@ -394,6 +398,15 @@ export default function Cockpit() {
   const dailyTrainingSessions = dailyTraining?.sessions || (dailyTraining ? [dailyTraining] : [])
   const dailyTrainingPrimarySessions = dailyTrainingSessions.slice(0, 3)
   const dailyTrainingFutureSessions = dailyTrainingSessions.slice(3, 8)
+  // Le bloc J+3→J+7 disparait des que l'API renvoie moins de 4 seances (ex.
+  // repli sur le snapshot coach statique) : on trace la source pour pouvoir
+  // diagnostiquer depuis le mobile sans devinettes.
+  console.log(
+    '[Cockpit] daily training:', dailyTrainingSessions.length, 'sessions',
+    '· source=', dailyTraining?.planSource || 'none',
+    '· future=', dailyTrainingFutureSessions.length,
+    '· dates=', dailyTrainingSessions.map(s => s.date).join(',')
+  )
   const dailyTrainingDataThrough = dailyTraining?.dataThrough
     ? parseLocalDate(dailyTraining.dataThrough).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })
     : null
@@ -416,7 +429,7 @@ export default function Cockpit() {
 
           {/* FC Max card with inline edit */}
           <div className="card px-3 py-3 relative cockpit_fcmax_card" data-name="cockpit_fcmax_card">
-            <div className="metric_label_caps mb-1 cockpit_fcmax_label" data-name="cockpit_fcmax_label">FC max</div>
+            <div className="metric_label_caps mb-1 cockpit_fcmax_label" data-name="cockpit_fcmax_label">FC max utilisée</div>
             {editingFcMax ? (
               <div className="cockpit_fcmax_editor" data-name="cockpit_fcmax_editor">
                 <div className="flex items-center gap-1 cockpit_fcmax_editor_row" data-name="cockpit_fcmax_editor_row">
@@ -434,7 +447,7 @@ export default function Cockpit() {
                 </div>
                 {isOverridden && (
                   <button onClick={resetFcMax} className="flex items-center gap-1 mt-1 text-[10px] text-txt-muted hover:text-primary cockpit_fcmax_reset_button" data-name="cockpit_fcmax_reset_button">
-                    <RotateCcw size={10} /> Auto ({autoFcMax})
+                    <RotateCcw size={10} /> {observedFcMax90dInfo.source === 'observed_90d' ? 'Observée 90 j' : 'Référence'} ({observedFcMax90dInfo.hr})
                   </button>
                 )}
               </div>
@@ -448,11 +461,19 @@ export default function Cockpit() {
               </div>
             )}
             {!editingFcMax && isOverridden && (
-              <div className="metric_note_tiny_warning cockpit_fcmax_manual_note" data-name="cockpit_fcmax_manual_note">Manuel</div>
+              <div
+                className="metric_note_tiny_warning cockpit_fcmax_manual_note"
+                data-name="cockpit_fcmax_manual_note"
+                title="Réglage enregistré uniquement dans le stockage local de ce navigateur"
+              >
+                Manuelle · ce navigateur uniquement
+              </div>
             )}
             {!editingFcMax && !isOverridden && (
               <div className="metric_note_tiny cockpit_fcmax_auto_note" data-name="cockpit_fcmax_auto_note">
-                90j auto{autoFcMaxInfo.date ? ` · ${parseLocalDate(autoFcMaxInfo.date).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })}` : ''}
+                {observedFcMax90dInfo.source === 'observed_90d'
+                  ? `Observée sur 90 j${observedFcMax90dInfo.date ? ` · ${parseLocalDate(observedFcMax90dInfo.date).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })}` : ''}`
+                  : 'Référence personnelle · aucune FC max observée sur 90 j'}
               </div>
             )}
           </div>
@@ -495,7 +516,7 @@ export default function Cockpit() {
               </div>
             )}
             <p className="text-base text-txt mb-2 cockpit_daily_training_observations" data-name="cockpit_daily_training_observations">{dailyTraining.observations}</p>
-            <p className="text-sm text-txt-secondary mb-4 cockpit_daily_training_adjustment" data-name="cockpit_daily_training_adjustment">{dailyTraining.adjustment}</p>
+            <p className="text-sm text-txt-secondary mb-3 cockpit_daily_training_adjustment" data-name="cockpit_daily_training_adjustment">{dailyTraining.adjustment}</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3 cockpit_daily_training_sessions" data-name="cockpit_daily_training_sessions">
               {dailyTrainingPrimarySessions.map((guidance, index) => (
                 <TrainingDayPanel key={guidance.date} guidance={guidance} primary={index === 0} maxHr={currentFcMax} />
@@ -514,6 +535,26 @@ export default function Cockpit() {
           </div>
         )}
 
+        {/* Plan marathon complet — PDF téléchargeable et lisible dans le navigateur */}
+        <div className="mt-3 pt-3 border-t border-surface-border flex flex-wrap items-center gap-2 cockpit_daily_training_plan_pdf" data-name="cockpit_daily_training_plan_pdf">
+          <a
+            href="/training-plan.pdf"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-surface-muted text-txt-secondary hover:text-txt hover:bg-surface-hover transition-colors cockpit_daily_training_plan_pdf_view"
+            data-name="cockpit_daily_training_plan_pdf_view"
+          >
+            <FileText size={13} /> Lire le plan complet (PDF)
+          </a>
+          <a
+            href="/training-plan.pdf"
+            download="training-plan.pdf"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-txt-muted hover:text-txt hover:bg-surface-hover transition-colors cockpit_daily_training_plan_pdf_download"
+            data-name="cockpit_daily_training_plan_pdf_download"
+          >
+            <Download size={13} /> Télécharger
+          </a>
+        </div>
       </div>
 
       {/* Recent Activities + Map side by side */}
@@ -552,7 +593,6 @@ export default function Cockpit() {
               height="100%"
               className="h-full min-h-[280px]"
               onRunClick={handleRunClick}
-              fitRunIds={recentRunIds}
               highlightRunIds={recentRunIds}
               flush
             />

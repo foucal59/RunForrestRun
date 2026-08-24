@@ -133,6 +133,9 @@ _pg._ensure_activities_pk = lambda conn: None
 # SQLite uses a composite key for splits and does not need the Postgres sequence
 # repair performed before inserting detail rows.
 _pg._ensure_activity_splits_id_default = lambda cur: None
+# Pas d'information_schema en SQLite : _ensure_sqlite_columns() a déjà ajouté
+# elevation_delta depuis RUN_METRIC_COLUMN_DEFINITIONS au démarrage.
+_pg._ensure_best_effort_elevation_column = lambda cur: None
 # No secondary-DB replication in SQLite mode: blank both candidate URLs so
 # _pg._secondary_url() resolves to "" (database_pg reads these live).
 _pg.NEON_DATABASE_URL = ""

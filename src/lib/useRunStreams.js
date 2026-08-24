@@ -1,5 +1,12 @@
 import { useState, useMemo, useCallback } from 'react'
-import { buildZones, computeTimeInZones, computeRelativeEffort, getMaxHrForDate } from './heartRateZones'
+import {
+  buildZones,
+  computeTimeInZones,
+  computeRelativeEffort,
+  getObservedMaxHrForDate,
+  OBSERVED_MAX_HR_WINDOW_DAYS,
+  PERSONAL_MAX_HR_FALLBACK,
+} from './heartRateZones'
 import { computeActivityBestEfforts } from './bestEfforts'
 import { fmtPaceFromSpeed } from './compute'
 import { resolveRunTrace } from './runMaps'
@@ -14,10 +21,15 @@ import { findNearestStreamDatum, getActiveStreamPoint, readStreamIndexFromChartS
 export function useRunStreams({ activity, allActivities, streams, zoneData, activityId, samples }) {
   const [activeStreamIndex, setActiveStreamIndex] = useState(null)
 
-  // Contextual FC max: use the 90-day window before THIS activity's date
+  // Contextual FC max: use the maximum observed during the 90 days preceding
+  // THIS activity, with the personal fallback only when that window is empty.
   const maxHr = useMemo(() => {
-    if (!activity || !allActivities.length) return 190
-    return getMaxHrForDate(allActivities, activity.start_date_local, 90)
+    if (!activity || !allActivities.length) return PERSONAL_MAX_HR_FALLBACK
+    return getObservedMaxHrForDate(
+      allActivities,
+      activity.start_date_local,
+      OBSERVED_MAX_HR_WINDOW_DAYS
+    )
   }, [allActivities, activity])
 
   const zones = useMemo(() => buildZones(zoneData, maxHr), [zoneData, maxHr])

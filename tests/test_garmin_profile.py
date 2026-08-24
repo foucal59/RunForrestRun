@@ -11,7 +11,7 @@ class FakeClient:
 
 class FakeGarmin:
     client = FakeClient()
-    full_name = "Test Runner"
+    full_name = "Alex Runner"
     display_name = "garmin-display-name"
 
     def get_user_profile(self):
@@ -23,7 +23,7 @@ class GarminProfileTests(unittest.TestCase):
         profile = _build_profile(FakeGarmin())
 
         self.assertEqual(profile["user_id"], 62585735)
-        self.assertEqual(profile["full_name"], "Test Runner")
+        self.assertEqual(profile["full_name"], "Alex Runner")
 
     def test_token_load_survives_social_profile_failure(self):
         class FakeTokenClient:

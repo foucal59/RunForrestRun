@@ -1,54 +1,71 @@
 from __future__ import annotations
 
-import os
+import contextvars
+import math
 import re
+import sys
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from runner_profile import PACE_TARGETS, PROFILE, fmt_clock
 
-EASY_PACE = "6:15-6:45/km"
-RECOVERY_PACE = "6:35-7:05/km"
-STEADY_PACE = "5:55-6:15/km"
-THRESHOLD_PACE = "5:00-5:10/km"
-GOAL_PACE = "5:25-5:35/km"
-GOAL_PACE_TIGHT = "5:30/km"
-SEMI_PACE = "5:15-5:25/km"
-VO2_PACE = "4:40-4:55/km"
-STRIDES_PACE = "4:20-4:35/km"
+# ── Allures d'entrainement ──────────────────────────────────────────────────
+# Aucune allure n'est ecrite en dur : toutes se deduisent de l'objectif du
+# coureur (`runner_profile.derive_paces`). Un plan dont les allures sont figees
+# dans le code n'est le plan que d'une seule personne — et se perime des que
+# celle-ci progresse.
+EASY_PACE = PROFILE.pace("easy")
+RECOVERY_PACE = PROFILE.pace("recovery")
+STEADY_PACE = PROFILE.pace("steady")
+THRESHOLD_PACE = PROFILE.pace("threshold")
+GOAL_PACE = PROFILE.pace("marathon")
+GOAL_PACE_TIGHT = PROFILE.pace_target("marathon")
+VO2_PACE = PROFILE.pace("vo2")
+STRIDES_PACE = PROFILE.pace("strides")
+SEMI_PACE = PROFILE.pace("semi")
 LONG_COMPLETION_RATIO = 0.85
 # Une seance qualite n'est "couverte" que si le run atteint 70% du volume prevu :
 # un 3 km rapide ne remplace pas un seuil de 4 x 6'.
 QUALITY_COMPLETION_RATIO = 0.70
-# Le seuil est volontairement generique. Chaque utilisateur doit adapter les
-# allures d'exemple a son niveau avant d'utiliser le plan.
-MARATHON_PACE_MAX_SEC = 345
-PLAN_SOURCE = "marathon-template"
-# Libelles affiches dans l'UI. Surchargeables sans toucher au code :
-#   PLAN_RACE_NAME / PLAN_DESCRIPTION dans l'environnement.
-RACE_NAME = os.environ.get("PLAN_RACE_NAME", "Marathon")
-PLAN_DESCRIPTION = os.environ.get(
-    "PLAN_DESCRIPTION",
-    f"Coach {RACE_NAME} (modele de 16 semaines a personnaliser)",
-)
+# Fenetre de reconnaissance d'un bloc a allure marathon dans un run reel, calee
+# sur l'allure objectif du coureur. Trop lent = sortie longue facile, trop
+# rapide = seuil : ni l'un ni l'autre ne valide le travail specifique demande.
+MARATHON_PACE_MIN_SEC, MARATHON_PACE_MAX_SEC = PROFILE.marathon_pace_window
+# Une sortie longue peut etre courue plusieurs jours avant la date prevue (week-end
+# deplace, meteo, voyage). La fenetre reelle est bornee par la SL planifiee
+# precedente ; ce plafond evite qu'un run du debut de semaine de plan fasse
+# sauter la SL qui vient.
+LONG_ADVANCE_MAX_DAYS = 4
+# Un fractionne courru en montagne (ou par forte chaleur) a une allure moyenne
+# lente et une FC moyenne basse : les moyennes de l'activite ne le distinguent
+# pas d'un footing. Seules les laps gardent l'alternance effort/recup qui signe
+# la seance. Ces seuils decrivent une VRAIE rep de travail, pas un km d'auto-lap.
+INTERVAL_REP_MIN_SECONDS = 60
+INTERVAL_REP_MAX_SECONDS = 15 * 60
+INTERVAL_MIN_BLOCKS = 3
+INTERVAL_MIN_WORK_SECONDS = 6 * 60
+# Une rep est "dure" si elle est nettement plus rapide que la moyenne de la
+# sortie, ou nettement plus haute en FC.
+INTERVAL_REP_PACE_RATIO = 0.88
+INTERVAL_REP_HR_MARGIN = 6
+# Un dossard, ce n'est pas seulement la distance officielle : l'echauffement
+# et le retour au calme font partie de la seance et de la semaine. Ces deux
+# constantes cadrent a la fois le texte affiche et l'estimation de volume.
+RACE_WARMUP_MINUTES = 20
+RACE_COOLDOWN_MINUTES = 12
+PLAN_SOURCE = "plan-genere"
+PLAN_DESCRIPTION = PROFILE.description
 PLAN_BASIS = "Adapte sur les 10 derniers entrainements charges"
-def _configured_date(name: str, fallback: date) -> date:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        return fallback
-    try:
-        return date.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must use YYYY-MM-DD format") from exc
-
-
-_today = date.today()
-_next_thursday = _today + timedelta(days=(3 - _today.weekday()) % 7)
-PLAN_START = _configured_date("PLAN_START_DATE", _next_thursday)
-RACE_DAY = _configured_date("PLAN_RACE_DATE", PLAN_START + timedelta(days=108))
-if RACE_DAY <= PLAN_START:
-    raise ValueError("PLAN_RACE_DATE must be after PLAN_START_DATE")
+RACE_NAME = PROFILE.race_name
+RACE_DAY = PROFILE.race_date
+PLAN_START = PROFILE.plan_start
 PLAN_END = RACE_DAY
+# Lundi de la S1. Les jours anterieurs sont la REPRISE, hors numerotation :
+# compter la reprise comme "Semaine 1" decalerait tous les libelles de +1 par
+# rapport a la periodisation annoncee (S1-Sn, la derniere etant la course).
+PLAN_WEEK_ONE = PROFILE.week_one_monday
+TAPER_START = PROFILE.taper_start
 
 
 def _easy(minutes: int, strides: int = 0) -> dict[str, Any]:
@@ -114,6 +131,26 @@ def _race(title: str) -> dict[str, Any]:
     return {"kind": "race", "category": "race", "title": title}
 
 
+def _race_plan(title: str, main: str, *, tag: str) -> dict[str, Any]:
+    """Course qui n'est pas l'objectif du plan (dossard prepa, 10 km, semi).
+
+    Le kind reste "custom" : le kind "race" est cable en dur sur le marathon
+    (42,2 km, 200 min, strategie de course, gels tous les 5 km) et rendrait
+    n'importe quel autre dossard absurde. Seule la CATEGORIE est "race" : badge
+    rouge sur la page Plan, seance cle, jamais exportee en seance structuree
+    Garmin (on ne programme pas une course sur la montre), et jamais reecrite
+    par l'adaptation automatique.
+    """
+    return _custom(
+        title,
+        category="race",
+        warmup=f"{RACE_WARMUP_MINUTES}' footing progressif + 4 lignes de 20'' + gammes courtes",
+        main=main,
+        cooldown=f"{RACE_COOLDOWN_MINUTES}' tres facile",
+        tag=tag,
+    )
+
+
 def _planned(
     title: str,
     main: str,
@@ -159,204 +196,537 @@ def _long_plan(title: str, main: str, *, tag: str = "marathon-long") -> dict[str
     )
 
 
-def _build_calendar() -> dict[str, dict[str, Any]]:
-    # Calendrier de base du bloc marathon (16 semaines, course ancree a RACE_DAY).
-    # Sert d'exemple : adapte les dates, allures et seances a ton propre objectif.
-    calendar: dict[str, dict[str, Any]] = {
-        (PLAN_START + timedelta(days=0)).isoformat(): _easy_plan("Footing facile + lignes", f"40' a {EASY_PACE} + 4 lignes de 20'' relachees"),
-        (PLAN_START + timedelta(days=1)).isoformat(): _rest(),
-        (PLAN_START + timedelta(days=2)).isoformat(): _easy_plan("Footing facile", f"45' a {EASY_PACE}"),
-        (PLAN_START + timedelta(days=3)).isoformat(): _long_plan("Sortie longue facile", "60-70' facile, 12-13 km sans bloc rapide"),
+# ── Generation du calendrier ────────────────────────────────────────────────
+#
+# Le calendrier n'est plus une liste de dates ecrite a la main : c'est une trame
+# de periodisation CALCULEE depuis le profil du coureur (date de course, nombre
+# de semaines, jour de sortie longue, bornes de volume). La version precedente
+# encodait un bloc marathon reel, date au jour, avec ses notes retrospectives :
+# elle n'etait rejouable par personne d'autre, et perimee le lendemain de la
+# course.
+#
+# Trame produite, identique dans son esprit a un plan marathon classique :
+#   reprise (demi-semaine)  -> mise en route, aucune intensite
+#   base (S1..Sb)           -> fonciere + premiers rappels de vitesse
+#   specifique (Sb+1..Sn-t-1) -> seuil et blocs a allure marathon dans la SL
+#   rodage (Sn-t)           -> semi test, le point d'appui de la cible chrono
+#   affutage (t dernieres)  -> volume qui tombe, allure specifique qui reste
+#
+# Une semaine sur quatre est une DECHARGE : c'est elle qui permet a la moyenne
+# de monter. La semaine qui precede le semi test en est toujours une.
+
+# Part des semaines de construction consacree a la fonciere. 0.36 sur un bloc de
+# 11 semaines donne 4 semaines de base et 7 de specifique, la repartition usuelle.
+BASE_PHASE_SHARE = 0.36
+
+# Une decharge ramene la sortie longue a ce ratio du dernier palier atteint,
+# sans jamais descendre sous la SL de depart.
+DELOAD_LONG_RATIO = 0.65
+
+# Affutage : ce qu'il reste de la SL de pic, semaine par semaine en partant de
+# la plus eloignee de la course. Le volume tombe, l'allure specifique reste.
+TAPER_LONG_RATIOS = (0.70, 0.50, 0.35)
+TAPER_AM_KM = (8, 5, 3)
+
+# Volume des footings, en minutes, du debut a la fin de la rampe.
+EASY_MINUTES_RANGE = (45, 60)
+STEADY_MINUTES_RANGE = (60, 80)
+RECOVERY_MINUTES_RANGE = (30, 40)
+
+# Facteur de volume applique aux footings hors sortie longue. Une decharge ou une
+# semaine d'affutage qui garderait le volume des semaines de charge n'en serait
+# pas une : c'est le total hebdomadaire qui doit tomber, pas seulement la SL.
+DELOAD_VOLUME_FACTOR = 0.80
+TAPER_VOLUME_FACTORS = (0.75, 0.55, 0.45)
+
+# Un bloc a allure marathon a besoin d'une mise en route : la dose ne depasse
+# jamais la SL moins cette reserve.
+LONG_AM_WARMUP_KM = 8
+
+
+def _lerp(low: float, high: float, position: float) -> float:
+    return low + (high - low) * position
+
+
+def _phase_of_week(week_num: int, build_weeks: int, base_weeks: int, plan_weeks: int) -> str:
+    """Phase d'une semaine numerotee (S1 = 1, la course est en S`plan_weeks`)."""
+    if week_num >= plan_weeks:
+        return "race_week"
+    if week_num > build_weeks + 1:
+        return "taper"
+    if week_num == build_weeks + 1:
+        return "peak"
+    if week_num <= base_weeks:
+        return "base"
+    return "specific"
+
+
+def _plan_shape() -> dict[str, Any]:
+    """Decoupage en phases et rampes, deduit du seul cadrage du profil."""
+    plan_weeks = PROFILE.plan_weeks
+    taper_weeks = PROFILE.taper_weeks
+    # Les semaines de construction : tout sauf l'affutage et la semaine de rodage.
+    build_weeks = max(2, plan_weeks - taper_weeks - 1)
+    base_weeks = max(1, min(build_weeks - 1, round(build_weeks * BASE_PHASE_SHARE)))
+
+    # Decharge toutes les 4 semaines, et systematiquement la derniere semaine de
+    # construction : le semi test du rodage se court sur des jambes fraiches.
+    deloads = {
+        week
+        for week in range(1, build_weeks + 1)
+        if week % 4 == 0 or week == build_weeks
+    }
+    ramp = [week for week in range(1, build_weeks + 1) if week not in deloads]
+
+    long_km: dict[int, int] = {}
+    long_am_km: dict[int, int] = {}
+    easy_scale: dict[int, float] = {}
+    last_ramp_long = PROFILE.long_start_km
+
+    # Les deux premieres semaines de rampe restent sans allure marathon : on
+    # installe d'abord le volume, l'allure specifique vient ensuite.
+    am_ramp = ramp[2:]
+
+    for index, week in enumerate(ramp):
+        position = index / (len(ramp) - 1) if len(ramp) > 1 else 1.0
+        long_km[week] = int(round(_lerp(PROFILE.long_start_km, PROFILE.long_peak_km, position)))
+        easy_scale[week] = position
+        last_ramp_long = long_km[week]
+        if week in am_ramp:
+            am_position = am_ramp.index(week) / (len(am_ramp) - 1) if len(am_ramp) > 1 else 1.0
+            dose = int(round(_lerp(PROFILE.long_am_start_km, PROFILE.long_am_peak_km, am_position)))
+            long_am_km[week] = max(0, min(dose, long_km[week] - LONG_AM_WARMUP_KM))
+        else:
+            long_am_km[week] = 0
+
+    # Les decharges se calent sur le dernier palier atteint AVANT elles.
+    reached = PROFILE.long_start_km
+    for week in range(1, build_weeks + 1):
+        if week in deloads:
+            long_km[week] = max(PROFILE.long_start_km, int(round(reached * DELOAD_LONG_RATIO)))
+            long_am_km[week] = 0
+            easy_scale[week] = easy_scale.get(week - 1, 0.0) * 0.7
+        else:
+            reached = long_km[week]
+
+    return {
+        "planWeeks": plan_weeks,
+        "taperWeeks": taper_weeks,
+        "buildWeeks": build_weeks,
+        "baseWeeks": base_weeks,
+        "deloads": deloads,
+        "longKm": long_km,
+        "longAmKm": long_am_km,
+        "easyScale": easy_scale,
+        "peakLongKm": PROFILE.long_peak_km,
     }
 
-    weeks = {
-        PLAN_START + timedelta(days=4): [
-            _rest(),
-            _quality_plan("6 x 400 m VO2", "6 x 400 m a 4:00/km, recup 1'30 trot", tag="vo2"),
-            _easy_plan("Footing facile + lignes", "50' a 6:15-6:45/km + 5 lignes de 20''"),
-            # Exemple d'une 2e qualite absorbee dans la semaine : le moteur
-            # adaptatif allege alors la fin de semaine au lieu de la repeter.
-            _quality_plan("Tempo 9 km", "9 km a 4:30/km, seance absorbee: ne pas repeter", tag="tempo"),
-            _easy_plan("Footing de recuperation", "30-40' tres facile a 6:35-7:05/km", tag="recovery"),
-            # Exemple d'une sortie longue placee un jour en avance : le dimanche
-            # suivant bascule alors en recuperation (voir _reschedule_missed_key).
-            _long_plan("SL 16 km + AM (1 j d'avance)", "16 km facile dont les 4 derniers km a 5:25-5:35/km"),
-            _easy_plan("Recuperation (SL faite la veille)", "Repos, marche ou 30-40' tres facile a 6:35-7:05/km", tag="recovery"),
-        ],
-        PLAN_START + timedelta(days=11): [
-            _rest(),
-            _quality_plan("Seuil 3 x 8'", "3 x 8' a 4:20-4:25/km, recup 2' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "50' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "65' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 18 km avec AM", "18 km dont les 6 derniers a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=18): [
-            _rest(),
-            _quality_plan("Seuil 4 x 6'", "4 x 6' a 4:20/km, recup 90'' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "55' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "65' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 20 km avec AM", "20 km, dont les 8 derniers km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=25): [
-            _rest(),
-            _quality_plan("5 x 3' VO2", "5 x 3' a 4:00/km, recup 2' trot", tag="vo2"),
-            _easy_plan("Footing facile", "45' a 6:15-6:45/km"),
-            _rest(),
-            _easy_plan("Footing facile + lignes", "45' a 6:15-6:45/km + lignes"),
-            _easy_plan("Repos ou footing court", "Repos ou 30' tres facile a 6:35-7:05/km"),
-            _long_plan("SL 15 km facile", "15 km facile a 6:15-6:50/km"),
-        ],
-        PLAN_START + timedelta(days=32): [
-            _rest(),
-            _quality_plan("Seuil 5 x 6'", "5 x 6' a 4:18-4:22/km, recup 2' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "55' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "70' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 22 km avec AM", "22 km, dont les 8 derniers km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=39): [
-            _rest(),
-            _quality_plan("AM 5 x 2 km", "5 x 2 km a 5:30/km, recup 1' trot", tag="marathon-pace"),
-            _easy_plan("Footing facile", "55' a 6:15-6:45/km"),
-            _rest(),
-            _easy_plan("Endurance moyenne + lignes", "70' a 5:55-6:15/km + lignes", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 25 km avec AM", "25 km, dont 2 x 6 km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=46): [
-            _rest(),
-            _quality_plan("Seuil 3 x 10'", "3 x 10' a 4:22/km, recup 3' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "60' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "70' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 27 km steady", "27 km en steady a 5:15-5:30/km"),
-        ],
-        PLAN_START + timedelta(days=53): [
-            _rest(),
-            _quality_plan("6 x 400 m + 4 x 200 m", "6 x 400 m a 4:00/km + 4 x 200 m a 3:50/km, recup complete", tag="vo2"),
-            _easy_plan("Footing facile", "50' a 6:15-6:45/km"),
-            _rest(),
-            _easy_plan("Footing facile + lignes", "50' a 6:15-6:45/km + lignes"),
-            _easy_plan("Repos ou footing court", "Repos ou 30' tres facile a 6:35-7:05/km"),
-            _long_plan("SL 18 km facile", "18 km facile a 6:15-6:50/km"),
-        ],
-        PLAN_START + timedelta(days=60): [
-            _rest(),
-            _quality_plan("AM 2 x 5 km", "2 x 5 km a 5:30/km, recup 2' trot", tag="marathon-pace"),
-            _easy_plan("Footing facile + lignes", "60' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "70' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "45' a 6:15-6:45/km"),
-            _long_plan("SL 28 km avec AM", "28 km, dont 10-12 km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=67): [
-            _rest(),
-            _quality_plan("Seuil 4 x 8'", "4 x 8' a 4:20/km, recup 2' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "60' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "75' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "45' a 6:15-6:45/km"),
-            _long_plan("SL 30 km avec AM", "30 km, dont les 10 derniers km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=74): [
-            _rest(),
-            _quality_plan("AM 3 x 4 km", "3 x 4 km a 5:30/km, recup 90'' trot", tag="marathon-pace"),
-            _easy_plan("Footing facile + lignes", "60' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Endurance moyenne", "70' a 5:55-6:15/km", tag="steady"),
-            _easy_plan("Footing court", "40' a 6:15-6:45/km"),
-            _long_plan("SL 32 km avec AM", "32 km, dont 3 x 6 km a 5:25-5:35/km repartis"),
-        ],
-        PLAN_START + timedelta(days=81): [
-            _rest(),
-            _quality_plan("Seuil leger 3 x 6'", "3 x 6' a 4:22/km, recup 2' trot", tag="threshold"),
-            _easy_plan("Footing facile + lignes", "50' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Footing pre-course", "40' a 6:15-6:45/km + 4 lignes"),
-            _easy_plan("Repos ou footing court", "Repos ou 30' tres facile a 6:35-7:05/km"),
-            _long_plan("Semi-marathon test", f"Semi-marathon test: effort controle a {SEMI_PACE}, ou 21 km dont 12 km a AM", tag="race-test"),
-        ],
-        PLAN_START + timedelta(days=88): [
-            _rest(),
-            _quality_plan("AM 4 x 2 km", "4 x 2 km a 5:30/km, recup 1' trot", tag="marathon-pace"),
-            _easy_plan("Footing facile", "50' a 6:15-6:45/km"),
-            _rest(),
-            _easy_plan("Endurance moyenne + lignes", "55' a 5:55-6:15/km + lignes", tag="steady"),
-            _easy_plan("Footing court", "35' a 6:15-6:45/km"),
-            _long_plan("SL 20-22 km facile", "20-22 km facile, derniere vraie sortie longue"),
-        ],
-        PLAN_START + timedelta(days=95): [
-            _rest(),
-            _quality_plan("AM 3 x 2 km", "3 x 2 km a 5:30/km, recup 1' trot", tag="marathon-pace"),
-            _easy_plan("Footing facile + lignes", "45' a 6:15-6:45/km + lignes"),
-            _rest(),
-            _easy_plan("Footing facile", "40' a 6:15-6:45/km"),
-            _rest(),
-            _long_plan("14-16 km dont 5 km AM", "14-16 km dont 5 km a 5:25-5:35/km"),
-        ],
-        PLAN_START + timedelta(days=102): [
-            _rest(),
-            _easy_plan("Footing facile + lignes", "35' facile a 6:15-6:45/km + 4 lignes"),
-            _quality_plan("Rappel AM 3 x 1 km", "30' facile dont 3 x 1 km a 5:30/km, recup 2' facile", tag="marathon-pace"),
-            _easy_plan("Repos ou footing tres court", "Repos ou 25' tres facile a 6:35-7:05/km"),
-            _easy_plan("Footing tres facile + lignes", "25' tres facile + 3 lignes de 20''"),
-            _rest(),
-            _race(RACE_NAME),
-        ],
-    }
-    for monday, sessions in weeks.items():
-        for offset, session in enumerate(sessions):
-            calendar[(monday + timedelta(days=offset)).isoformat()] = deepcopy(session)
+
+PLAN_SHAPE = _plan_shape()
+
+
+def _scaled(bounds: tuple[int, int], position: float, factor: float = 1.0) -> int:
+    """Volume d'un footing a ce stade de la rampe, arrondi a 5 minutes."""
+    minutes = _lerp(bounds[0], bounds[1], max(0.0, min(1.0, position))) * factor
+    return max(20, int(round(minutes / 5.0) * 5))
+
+
+def _volume_factor(week_num: int, phase: str, shape: dict[str, Any]) -> float:
+    """Part du volume de reference que garde cette semaine."""
+    if phase == "taper":
+        rank = week_num - (shape["buildWeeks"] + 2)
+        return TAPER_VOLUME_FACTORS[min(max(rank, 0), len(TAPER_VOLUME_FACTORS) - 1)]
+    if phase == "peak":
+        return DELOAD_VOLUME_FACTOR
+    if week_num in shape["deloads"]:
+        return DELOAD_VOLUME_FACTOR
+    return 1.0
+
+
+def _quality_for_week(week_num: int, phase: str, shape: dict[str, Any]) -> dict[str, Any]:
+    """Seance dure de la semaine. Le type suit la phase, jamais le hasard."""
+    if phase == "race_week":
+        return _quality_plan(
+            "Rappel allure marathon",
+            f"30' facile dont 3 x 1 km a {GOAL_PACE_TIGHT}, recup 2' facile",
+            tag="marathon-pace",
+        )
+    if phase == "taper":
+        return _quality_plan(
+            "Allure marathon controlee",
+            f"3 x 2 km a {GOAL_PACE_TIGHT}, recup 1' trot",
+            tag="marathon-pace",
+        )
+    if phase == "peak":
+        # Le semi test est la seance dure de la semaine : le mardi reste leger.
+        return _quality_plan(
+            "Seuil leger",
+            f"3 x 6' a {THRESHOLD_PACE}, recup 2' trot (veille de test allegee)",
+            tag="threshold",
+        )
+    if week_num in shape["deloads"]:
+        return _quality_plan(
+            "Rappel allure marathon leger",
+            f"3 x 2 km a {GOAL_PACE_TIGHT}, recup 2' trot, sans accelerer",
+            tag="marathon-pace",
+        )
+    if phase == "base":
+        # Alternance vitesse / seuil : la base installe la cylindree avant que le
+        # specifique ne monopolise les seances dures.
+        if week_num % 2 == 1:
+            reps = 5 + week_num // 2
+            return _quality_plan(
+                f"{reps} x 400 m VO2",
+                f"{reps} x 400 m a {VO2_PACE}, recup 1'30 trot",
+                tag="vo2",
+            )
+        return _quality_plan(
+            "Seuil 3 x 8'",
+            f"3 x 8' a {THRESHOLD_PACE}, recup 2' trot",
+            tag="threshold",
+        )
+
+    # Specifique : le seuil porte le bloc, avec un rappel de vitesse et un bloc
+    # a allure marathon inseres regulierement pour ne perdre ni l'un ni l'autre.
+    slot = (week_num - shape["baseWeeks"] - 1) % 4
+    if slot == 1:
+        return _quality_plan(
+            "Bloc allure marathon",
+            f"5 x 2 km a {GOAL_PACE_TIGHT}, recup 1' trot",
+            tag="marathon-pace",
+        )
+    if slot == 3:
+        return _quality_plan(
+            "Rappel vitesse",
+            f"6 x 400 m a {VO2_PACE} + 4 x 200 m relaches, recup complete",
+            tag="vo2",
+        )
+    minutes = 6 if slot == 0 else 10
+    reps = 5 if slot == 0 else 3
+    return _quality_plan(
+        f"Seuil {reps} x {minutes}'",
+        f"{reps} x {minutes}' a {THRESHOLD_PACE}, recup 2' trot",
+        tag="threshold",
+    )
+
+
+def _long_for_week(week_num: int, phase: str, shape: dict[str, Any]) -> dict[str, Any]:
+    """Sortie longue de la semaine, avec sa dose eventuelle d'allure marathon."""
+    if phase == "peak":
+        semi_target = fmt_clock(PROFILE.projected("semi"))
+        return _long_plan(
+            "Semi-marathon test",
+            f"Semi test : viser {semi_target} ({SEMI_PACE}), ou 21 km dont 15 km a {GOAL_PACE}. "
+            "C'est ce chrono qui arrete la cible du jour J.",
+            tag="race-test",
+        )
+    if phase == "taper":
+        # Rang de la semaine d'affutage, la plus eloignee de la course d'abord.
+        rank = week_num - (shape["buildWeeks"] + 2)
+        ratio = TAPER_LONG_RATIOS[min(rank, len(TAPER_LONG_RATIOS) - 1)]
+        target = max(10, int(round(shape["peakLongKm"] * ratio)))
+        am_km = min(TAPER_AM_KM[min(rank, len(TAPER_AM_KM) - 1)], target - 6)
+        if am_km <= 0:
+            return _long_plan(f"Sortie longue allegee {target} km", f"{target} km facile a {EASY_PACE}")
+        return _long_plan(
+            f"SL {target} km dont {am_km} km AM",
+            f"{target} km dont {am_km} km a {GOAL_PACE}",
+        )
+
+    target = shape["longKm"][week_num]
+    am_km = shape["longAmKm"][week_num]
+    if not am_km:
+        label = "SL de decharge" if week_num in shape["deloads"] else "Sortie longue facile"
+        return _long_plan(f"{label} {target} km", f"{target} km facile a {EASY_PACE}, sans bloc rapide")
+
+    # Au-dela d'une certaine dose, le bloc continu est coupe en deux : courir
+    # l'allure jambes videes est l'objectif, pas d'empiler des kilometres.
+    if am_km >= 14:
+        half = am_km // 2
+        main = (
+            f"{target} km dont 2 x {half} km a {GOAL_PACE}, 1 km de trot entre les blocs, "
+            "ravitaillement comme le jour J"
+        )
+    else:
+        main = f"{target} km dont les {am_km} derniers a {GOAL_PACE}"
+    return _long_plan(f"SL {target} km avec AM", main)
+
+
+def _week_sessions(week_num: int, phase: str, shape: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Les 7 jours d'une semaine, indexes par jour de la semaine (0 = lundi).
+
+    Le gabarit se DEDUIT des trois jours choisis dans le profil (repos, qualite,
+    sortie longue) : la veille de la SL s'allege, le lendemain recupere, et les
+    jours restants portent le volume. Changer `longRunWeekday` dans le profil
+    deplace tout le reste sans toucher au code.
+    """
+    long_wd = PROFILE.long_run_weekday
+    quality_wd = PROFILE.quality_weekday
+    rest_wd = PROFILE.rest_weekday
+    position = shape["easyScale"].get(week_num, 1.0)
+    factor = _volume_factor(week_num, phase, shape)
+    # Une semaine allegee ne se contente pas de raccourcir : elle rend des jours.
+    light = factor < 1.0
+
+    eve_wd = (long_wd - 1) % 7
+    # Le lendemain de la sortie longue, modulo la semaine. Quand la SL tombe le
+    # dernier jour (dimanche), ce lendemain revient au LUNDI de la meme semaine :
+    # c'est voulu, puisque ce lundi suit bien une sortie longue — celle de la
+    # semaine precedente. Le gabarit se repete a l'identique chaque semaine.
+    after_wd = (long_wd + 1) % 7
+
+    sessions: dict[int, dict[str, Any]] = {}
+    sessions[long_wd] = _long_for_week(week_num, phase, shape)
+    if quality_wd not in sessions:
+        sessions[quality_wd] = _quality_for_week(week_num, phase, shape)
+
+    # Semaine de forte charge : le jour de repos devient un footing de volume et
+    # le lendemain de SL un vrai repos. La semaine reste a six sorties, sans
+    # jamais enchainer trois semaines sans jour off.
+    high_volume = (
+        phase == "specific"
+        and week_num not in shape["deloads"]
+        and shape["longKm"].get(week_num, 0) >= PROFILE.long_peak_km - 6
+    )
+
+    if rest_wd not in sessions:
+        if high_volume:
+            sessions[rest_wd] = _easy_plan(
+                "Footing de volume",
+                f"{_scaled(RECOVERY_MINUTES_RANGE, position)}' tres facile a {RECOVERY_PACE}",
+                tag="recovery",
+            )
+        else:
+            sessions[rest_wd] = _rest()
+
+    if after_wd not in sessions:
+        if high_volume:
+            sessions[after_wd] = _rest()
+        else:
+            sessions[after_wd] = _easy_plan(
+                "Footing de recuperation",
+                f"{_scaled(RECOVERY_MINUTES_RANGE, position, factor)}' tres facile "
+                f"a {RECOVERY_PACE}, ou repos",
+                tag="recovery",
+            )
+
+    if eve_wd not in sessions:
+        # La veille de la sortie longue est le premier jour qu'une semaine legere
+        # rend : c'est celui dont l'absence ne coute aucune adaptation.
+        sessions[eve_wd] = _rest() if light else _easy_plan(
+            "Footing court",
+            f"{_scaled((30, 40), position, factor)}' a {EASY_PACE} "
+            "(allegement avant la sortie longue)",
+        )
+
+    # Les jours restants portent le volume : un footing avec lignes, puis de
+    # l'endurance moyenne.
+    fillers = [
+        _easy_plan(
+            "Footing facile + lignes",
+            f"{_scaled(EASY_MINUTES_RANGE, position, factor)}' a {EASY_PACE} "
+            "+ 5 lignes de 20'' relachees",
+        ),
+        # L'endurance moyenne est de l'intensite douce : une semaine legere la
+        # remplace par du footing plutot que de la raccourcir.
+        _easy_plan(
+            "Footing facile",
+            f"{_scaled(EASY_MINUTES_RANGE, position, factor)}' a {EASY_PACE}",
+        )
+        if light
+        else _easy_plan(
+            "Endurance moyenne",
+            f"{_scaled(STEADY_MINUTES_RANGE, position, factor)}' a {STEADY_PACE}",
+            tag="steady",
+        ),
+    ]
+    for weekday in range(7):
+        if weekday in sessions:
+            continue
+        sessions[weekday] = fillers.pop(0) if fillers else _easy_plan(
+            "Footing facile",
+            f"{_scaled(EASY_MINUTES_RANGE, position, factor)}' a {EASY_PACE}",
+        )
+    return sessions
+
+
+def _race_week_sessions(shape: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Semaine de course : rien ne s'y gagne, tout peut s'y perdre.
+
+    Quatre sorties courtes au maximum avant le depart. Le rappel d'allure
+    marathon reste, parce qu'il rassure les jambes sans les fatiguer ; le volume,
+    lui, ne sert plus a rien a ce stade.
+    """
+    race_wd = PROFILE.race_date.weekday()
+    quality_wd = PROFILE.quality_weekday
+    sessions: dict[int, dict[str, Any]] = {race_wd: _race(PROFILE.race_name)}
+
+    # Le rappel d'allure ne tient que s'il reste au moins quatre jours de
+    # recuperation avant le depart.
+    if quality_wd < race_wd - 3:
+        sessions[quality_wd] = _quality_for_week(shape["planWeeks"], "race_week", shape)
+
+    # Les roles se lisent en jours AVANT la course, pas en jours de la semaine :
+    # c'est la seule facon d'obtenir le meme affutage quel que soit le jour ou
+    # tombe le depart.
+    for weekday in range(7):
+        if weekday in sessions:
+            continue
+        days_before = race_wd - weekday
+        if days_before < 0:
+            # Apres la course : repos, sans discussion.
+            sessions[weekday] = _rest()
+        elif days_before == 1:
+            sessions[weekday] = _easy_plan(
+                "Footing tres facile + lignes",
+                f"25' tres facile a {RECOVERY_PACE} + 3 lignes de 20'' (veille de course)",
+            )
+        elif days_before in (3, 4):
+            sessions[weekday] = _easy_plan(
+                "Footing facile + lignes",
+                f"30' facile a {EASY_PACE} + 4 lignes de 20''",
+            )
+        else:
+            # J-2 est un repos sec, et le debut de semaine n'a plus rien a
+            # apporter : c'est la que la fraicheur se fabrique.
+            sessions[weekday] = _rest()
+    return sessions
+
+
+def _build_calendar() -> dict[str, dict[str, Any]]:
+    """Le plan complet, jour par jour, genere depuis le profil du coureur.
+
+    Source unique de verite du site ET du coach matinal
+    (`scripts/seance_du_jour.py` lit ce module, il ne recopie aucun calendrier).
+    Les ajustements decides au jour le jour n'ont pas leur place ici : ils
+    passent par la table `plan_overrides` (voir `set_plan_overrides`).
+    """
+    shape = PLAN_SHAPE
+    calendar: dict[str, dict[str, Any]] = {}
+
+    # Reprise : la demi-semaine avant la S1. Mise en route, aucune intensite,
+    # une sortie longue courte pour poser l'habitude du jour choisi.
+    week_one = PROFILE.week_one_monday
+    reprise_days = []
+    day = PROFILE.plan_start
+    while day < week_one:
+        reprise_days.append(day)
+        day += timedelta(days=1)
+
+    # UNE seule sortie longue dans la reprise : celle du jour choisi si la
+    # periode le contient, sinon le dernier jour. Tester les deux conditions
+    # jour par jour en posait deux quand la reprise se terminait la veille de
+    # la S1 sur le jour de sortie longue.
+    reprise_long_day = next(
+        (day for day in reprise_days if day.weekday() == PROFILE.long_run_weekday),
+        reprise_days[-1] if reprise_days else None,
+    )
+    for day in reprise_days:
+        if day == reprise_long_day:
+            session = _long_plan(
+                "Sortie longue facile",
+                f"60-70' facile a {EASY_PACE}, sans bloc rapide",
+            )
+        elif day.weekday() == PROFILE.rest_weekday:
+            session = _rest()
+        else:
+            session = _easy_plan("Footing facile", f"45' a {EASY_PACE}")
+        calendar[day.isoformat()] = session
+
+    for week_num in range(1, shape["planWeeks"] + 1):
+        monday = week_one + timedelta(weeks=week_num - 1)
+        phase = _phase_of_week(week_num, shape["buildWeeks"], shape["baseWeeks"], shape["planWeeks"])
+        sessions = (
+            _race_week_sessions(shape)
+            if phase == "race_week"
+            else _week_sessions(week_num, phase, shape)
+        )
+        for weekday, session in sessions.items():
+            calendar[(monday + timedelta(days=weekday)).isoformat()] = deepcopy(session)
     return calendar
 
 
-# Le plan source etait cale avec les sorties longues le dimanche. A partir de
-# la premiere semaine non figee par des seances deja realisees, on normalise le
-# calendrier de base sur des SL le samedi : la case affichee le jour J reprend
-# ce que le plan initial prevoyait en J+1 (SL du dimanche -> samedi, qualite du
-# mardi -> lundi, etc.). Contraintes :
-#  - la course reste ancree a RACE_DAY ; la veille devient repos ;
-#  - les jours anterieurs a SATURDAY_LONG_RUN_START ne bougent pas, pour preserver
-#    les seances de la premiere semaine a leur date d'origine.
-SATURDAY_LONG_RUN_START = PLAN_START + timedelta(days=11)
+PLAN_CALENDAR = _build_calendar()
 
 
-def _shift_calendar_to_saturday_long_runs(calendar: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Recale le calendrier de base sur des sorties longues le samedi.
+# ── Ajustements du coach (table plan_overrides) ──
+#
+# Le calendrier ci-dessus est fige dans le code : sans ce mecanisme, un
+# ajustement decide par le coach (SKILL.md, tache du matin) n'atteint jamais le
+# site. Les overrides sont charges depuis la base par l'appelant HTTP et poses
+# ici pour la duree de la requete. ContextVar plutot qu'un global : chaque
+# requete asyncio garde ses propres valeurs.
+_PLAN_OVERRIDES: contextvars.ContextVar[dict[str, dict[str, Any]]] = contextvars.ContextVar(
+    "plan_overrides",
+    default={},
+)
 
-    Formulation "pull" : la nouvelle case du jour D reprend l'ancienne seance de
-    J+1. La seance exactement a SATURDAY_LONG_RUN_START (repos du lundi) est
-    ainsi absorbee, sans collision avec la derniere journee conservee.
+# Champs libres autorises dans un ajustement du coach.
+_OVERRIDE_TEXT_FIELDS = ("title", "warmup", "main", "cooldown")
+_OVERRIDE_CATEGORIES = {"easy", "quality", "long", "rest", "race"}
+
+
+def set_plan_overrides(overrides: dict[str, Any] | None) -> None:
+    """Pose les ajustements du coach pour la duree du traitement en cours.
+
+    `overrides` est indexe par jour ISO ; chaque valeur est soit une seance deja
+    normalisee, soit le payload brut stocke en base (normalise a la volee).
     """
-    shifted: dict[str, dict[str, Any]] = {}
-    race_iso = None
-    for iso, session in calendar.items():
-        if session.get("kind") == "race":
-            race_iso = iso
-    for iso in calendar:
-        day = date.fromisoformat(iso)
-        if day < SATURDAY_LONG_RUN_START:
-            shifted[iso] = deepcopy(calendar[iso])  # passe : inchange
+    normalized: dict[str, dict[str, Any]] = {}
+    for day_iso, payload in (overrides or {}).items():
+        session = normalize_plan_override(payload)
+        if session is None:
             continue
-        nxt = calendar.get((day + timedelta(days=1)).isoformat())
-        if nxt is None or nxt.get("kind") == "race":
-            # Veille de course (ou fin de plan) : jour de repos.
-            shifted[iso] = _rest()
-        else:
-            shifted[iso] = deepcopy(nxt)
-    if race_iso is not None:
-        shifted[race_iso] = deepcopy(calendar[race_iso])  # marathon ancre
-    return shifted
+        normalized[str(day_iso)[:10]] = session
+    _PLAN_OVERRIDES.set(normalized)
 
 
-PLAN_CALENDAR = _shift_calendar_to_saturday_long_runs(_build_calendar())
-TAPER_START = RACE_DAY - timedelta(days=13)
+def active_plan_overrides() -> dict[str, dict[str, Any]]:
+    """Ajustements actuellement poses (lecture seule)."""
+    return _PLAN_OVERRIDES.get()
+
+
+def normalize_plan_override(payload: Any) -> dict[str, Any] | None:
+    """Transforme un ajustement du coach en seance exploitable par le plan.
+
+    Accepte le format minimal que le coach peut ecrire ({"kind": "rest"} ou
+    titre + contenu) et renvoie None si le payload est inutilisable, pour qu'un
+    ajustement mal forme n'efface jamais la seance planifiee.
+    """
+    if not isinstance(payload, dict):
+        return None
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else payload
+
+    if session.get("kind") == "rest" or session.get("category") == "rest":
+        out = _rest()
+        out["overrideNote"] = payload.get("note") or session.get("note")
+        return out
+
+    title = str(session.get("title") or "").strip()
+    main = str(session.get("main") or "").strip()
+    if not title or not main:
+        return None
+
+    category = str(session.get("category") or "easy").strip()
+    if category not in _OVERRIDE_CATEGORIES:
+        category = "easy"
+    builder = {
+        "quality": _quality_plan,
+        "long": _long_plan,
+    }.get(category)
+    if builder is not None:
+        out = builder(title, main)
+    else:
+        out = _easy_plan(title, main)
+    out["category"] = category
+    if session.get("tag"):
+        out["tag"] = str(session["tag"])
+    for field in _OVERRIDE_TEXT_FIELDS:
+        value = session.get(field)
+        if isinstance(value, str) and value.strip():
+            out[field] = value.strip()
+    out["overrideNote"] = payload.get("note") or session.get("note")
+    return out
 
 
 def _parse_day(value: str | date | datetime | None) -> date:
@@ -391,6 +761,12 @@ def _fmt_short_day(day_iso: str) -> str:
     names = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
     months = ["janv", "fevr", "mars", "avr", "mai", "juin", "juil", "aout", "sept", "oct", "nov", "dec"]
     return f"{names[current.weekday()]} {current.day} {months[current.month - 1]}"
+
+
+def _advance_label(days: int) -> str:
+    if days <= 1:
+        return "avec 1 jour d'avance"
+    return f"avec {days} jours d'avance"
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -472,6 +848,8 @@ def normalize_recent_training_runs(
             "pace_sec_per_km": pace,
             "average_heartrate": _coerce_float(item.get("average_heartrate")),
             "max_heartrate": _coerce_float(item.get("max_heartrate")),
+            # Rarement fournies par l'UI ; le serveur les rattache depuis la DB.
+            "laps": item.get("laps") if isinstance(item.get("laps"), list) else [],
         })
 
     runs.sort(key=lambda run: str(run.get("start_date_local") or run.get("date") or ""), reverse=True)
@@ -543,7 +921,11 @@ def _render_session(session: dict[str, Any]) -> dict[str, str]:
         return {
             "title": _session_title(session),
             "warmup": "5-10' tres facile + mobilite courte",
-            "main": "Marathon: depart prudent, puis stabiliser l'allure cible configuree. Accelerer seulement si les sensations et la FC restent maitrisees.",
+            "main": (
+                f"Marathon : premiers kilometres volontairement freines, puis installer "
+                f"{GOAL_PACE_TIGHT} (cible {PROFILE.goal_label}). Ne rien tenter de plus vite "
+                "avant le 30e kilometre."
+            ),
             "cooldown": "5-10' de marche et ravitaillement",
         }
     return {"title": "Seance du jour", "warmup": "-", "main": "-", "cooldown": "-"}
@@ -632,7 +1014,93 @@ def _looks_like_sl_effort(run: dict[str, Any]) -> bool:
     return (run.get("distance_km") or 0) >= 16 or (run.get("moving_time") or 0) >= 95 * 60
 
 
+def _lap_pace(lap: dict[str, Any]) -> float | None:
+    distance_m = lap.get("distance_m") or 0
+    moving_time = lap.get("moving_time") or 0
+    if distance_m <= 0 or moving_time <= 0:
+        return None
+    return moving_time / (distance_m / 1000.0)
+
+
+_INTERVAL_STRUCTURE_CACHE: dict[tuple[Any, int, int], tuple[int, float]] = {}
+
+
+def work_lap_blocks(run: dict[str, Any]) -> list[list[int]]:
+    """Blocs de travail deduits des laps, en index dans `run["laps"]`.
+
+    Un bloc = une ou plusieurs laps dures consecutives, separees des suivantes
+    par une lap de recuperation. `_interval_structure` utilise cette decoupe pour
+    savoir si une seance cle a deja ete couverte.
+    """
+    laps = run.get("laps") or []
+    run_pace = run.get("pace_sec_per_km") or 0
+    run_hr = run.get("average_heartrate") or 0
+    hard: list[int] = []
+    for index, lap in enumerate(laps):
+        moving_time = lap.get("moving_time") or 0
+        if not INTERVAL_REP_MIN_SECONDS <= moving_time <= INTERVAL_REP_MAX_SECONDS:
+            continue
+        pace = _lap_pace(lap)
+        lap_hr = lap.get("average_heartrate") or 0
+        faster = pace is not None and run_pace > 0 and pace <= run_pace * INTERVAL_REP_PACE_RATIO
+        hotter = lap_hr > 0 and run_hr > 0 and lap_hr >= run_hr + INTERVAL_REP_HR_MARGIN
+        if faster or hotter:
+            hard.append(index)
+
+    blocks: list[list[int]] = []
+    for index in hard:
+        if blocks and index == blocks[-1][-1] + 1:
+            blocks[-1].append(index)
+        else:
+            blocks.append([index])
+    return blocks
+
+
+def _interval_structure(run: dict[str, Any]) -> tuple[int, float]:
+    """(nombre de blocs de travail, secondes de travail) deduits des laps.
+
+    Retourne (0, 0.0) quand la sortie n'a pas de structure d'intervalles.
+    Exiger plusieurs blocs SEPARES ecarte le footing auto-lape ou la derive
+    cardiaque ferait passer les derniers kilometres pour des reps : ceux-la
+    forment un seul bloc contigu en fin de sortie.
+    """
+    laps = run.get("laps") or []
+    if len(laps) < INTERVAL_MIN_BLOCKS:
+        return 0, 0.0
+
+    cache_key = (run.get("id"), len(laps), int(run.get("moving_time") or 0))
+    if run.get("id") is not None and cache_key in _INTERVAL_STRUCTURE_CACHE:
+        return _INTERVAL_STRUCTURE_CACHE[cache_key]
+
+    blocks = work_lap_blocks(run)
+    work_seconds = float(sum(
+        laps[index].get("moving_time") or 0
+        for block in blocks
+        for index in block
+    ))
+
+    if len(blocks) < INTERVAL_MIN_BLOCKS or work_seconds < INTERVAL_MIN_WORK_SECONDS:
+        result = (0, 0.0)
+    else:
+        result = (len(blocks), work_seconds)
+
+    if run.get("id") is not None:
+        _INTERVAL_STRUCTURE_CACHE[cache_key] = result
+        print(
+            f"[plan-intervals] run {run.get('id')} ({run.get('date')}): "
+            f"{len(laps)} laps, {len(blocks)} bloc(s) durs, "
+            f"{int(work_seconds)}s de travail -> structure="
+            f"{'oui' if result[0] else 'non'}",
+            file=sys.stderr,
+        )
+    return result
+
+
 def _looks_quality(run: dict[str, Any]) -> bool:
+    # Structure d'intervalles reelle : elle prime sur les moyennes, qui ne
+    # voient pas un fractionne courru en cote ou avec de longues recups.
+    if _interval_structure(run)[0]:
+        return True
     pace = run.get("pace_sec_per_km") or 0
     avg_hr = run.get("average_heartrate") or 0
     max_hr = run.get("max_heartrate") or 0
@@ -701,7 +1169,12 @@ def _effort_vs_plan(run: dict[str, Any], session: dict[str, Any]) -> str:
     return "matching"
 
 
-def _complete_today(run: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+def _complete_today(
+    run: dict[str, Any],
+    session: dict[str, Any],
+    *,
+    force_matching: bool = False,
+) -> dict[str, Any]:
     effort_kind, done_title = _classify_effort(run)
     details = [f"{run['distance_km']:.1f} km en {_fmt_duration(run.get('moving_time'))}"]
     if run.get("pace_sec_per_km"):
@@ -709,7 +1182,12 @@ def _complete_today(run: dict[str, Any], session: dict[str, Any]) -> dict[str, A
     if run.get("average_heartrate"):
         details.append(f"{int(round(run['average_heartrate']))} bpm")
     summary = ", ".join(details)
-    direction = _effort_vs_plan(run, session)
+    # `matched_session_for_run` peut rattacher une qualite a la seance du
+    # lendemain grace aux laps, meme quand l'allure moyenne (echauffement et
+    # recuperations inclus) ne ressemble pas a l'allure cible. Dans ce cas le
+    # rattachement est deja la decision : ne pas requalifier ensuite la sortie
+    # comme "plus exigeante" sur sa seule moyenne.
+    direction = "matching" if force_matching else _effort_vs_plan(run, session)
     if direction == "lighter" and session.get("category") == "long" and effort_kind == "long":
         done_title = "Sortie longue partielle deja faite"
     planned_title = _session_title(session)
@@ -747,6 +1225,14 @@ def _complete_today(run: dict[str, Any], session: dict[str, Any]) -> dict[str, A
         "kind": "custom",
         "category": "done",
         "title": done_title,
+        # La page Plan additionne les seances faites et celles qui restent. Sans
+        # ces valeurs, toute sortie terminee disparaissait du total hebdomadaire.
+        "actualDistanceKm": run.get("distance_km"),
+        "actualMinutes": (
+            int(round((run.get("moving_time") or 0) / 60))
+            if run.get("moving_time")
+            else None
+        ),
         "warmup": "Seance deja lancee aujourd'hui",
         "main": main,
         "cooldown": "5-10' de marche ou mobilite legere",
@@ -786,7 +1272,7 @@ def _planned_am_km(session: dict[str, Any]) -> float | None:
     reps = re.search(r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*km", main)
     if reps:
         return int(reps.group(1)) * float(reps.group(2).replace(",", "."))
-    single = re.search(r"(\d+(?:[.,]\d+)?)\s*km[^.]*?\d:\d{2}", main)
+    single = re.search(r"(\d+(?:[.,]\d+)?)\s*km[^.]*?4:3[57]", main)
     if single:
         return float(single.group(1).replace(",", "."))
     return None
@@ -795,12 +1281,12 @@ def _planned_am_km(session: dict[str, Any]) -> float | None:
 def _planned_marathon_pace_was_completed(session: dict[str, Any], run: dict[str, Any]) -> bool:
     """Un bloc AM n'est couvert que par un effort reellement a allure marathon.
 
-    Les seuils absolus precedents se trompaient dans les
+    Les seuils absolus precedents (>= 8 km, <= 5:10/km) se trompaient dans les
     deux sens : une sortie longue lente de 20 km validait "AM 5 x 2 km", tandis
     qu'un rappel de taper "3 x 1 km" courru pile n'etait jamais reconnu.
     """
     pace = run.get("pace_sec_per_km") or 0
-    if not 0 < pace <= MARATHON_PACE_MAX_SEC:
+    if not MARATHON_PACE_MIN_SEC <= pace <= MARATHON_PACE_MAX_SEC:
         return False
     distance_km = run.get("distance_km") or 0
     planned_km = _planned_am_km(session)
@@ -809,15 +1295,60 @@ def _planned_marathon_pace_was_completed(session: dict[str, Any], run: dict[str,
     return distance_km >= 8
 
 
+def _planned_work_seconds(session: dict[str, Any]) -> float:
+    """Volume de travail effectif prevu ("5 x 3'" -> 900 s), 0 si non exprime."""
+    total = 0.0
+    for reps, minutes in re.findall(r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*'", session.get("main") or ""):
+        total += int(reps) * float(minutes.replace(",", ".")) * 60
+    return total
+
+
 def _planned_quality_was_completed(session: dict[str, Any], run: dict[str, Any]) -> bool:
     """Qualite couverte seulement si le volume approche celui prevu."""
     if not _is_true_quality_run(run):
         return False
     _, planned_minutes = _estimate_effort(session)
     moving_time = run.get("moving_time") or 0
-    if planned_minutes and moving_time:
-        return moving_time >= planned_minutes * 60 * QUALITY_COMPLETION_RATIO
-    return True
+    if not moving_time:
+        distance_km = run.get("distance_km") or 0
+        pace = run.get("pace_sec_per_km") or 0
+        if distance_km and pace:
+            moving_time = distance_km * pace
+    if planned_minutes:
+        if moving_time and moving_time >= planned_minutes * 60 * QUALITY_COMPLETION_RATIO:
+            return True
+        # Echauffement ecourte ou recups marchees : le temps total peut rester
+        # court alors que tout le travail demande a ete fait. Les laps le disent.
+        planned_work = _planned_work_seconds(session)
+        work_seconds = _interval_structure(run)[1]
+        return bool(planned_work) and work_seconds >= planned_work * QUALITY_COMPLETION_RATIO
+
+    # Quelques seances historiques sont exprimees en distance continue
+    # ("Tempo 9 km") et n'ont donc pas d'estimation temporelle structuree.
+    planned_km = _parse_first_km(_session_text(session))
+    if planned_km:
+        return (run.get("distance_km") or 0) >= planned_km * QUALITY_COMPLETION_RATIO
+
+    # Sans volume planifie ni volume reel comparables, ne jamais conclure par
+    # defaut que la seance est couverte.
+    return False
+
+
+def _recent_quality_covering_session(
+    session: dict[str, Any],
+    runs: list[tuple[int, dict[str, Any]]],
+    *,
+    max_age: int,
+) -> tuple[int, dict[str, Any]] | None:
+    """Derniere vraie qualite dont la charge est comparable a la seance prevue."""
+    return next(
+        (
+            (age, run)
+            for age, run in runs
+            if age <= max_age and _planned_quality_was_completed(session, run)
+        ),
+        None,
+    )
 
 
 def _planned_long_was_completed(session: dict[str, Any], run: dict[str, Any]) -> bool:
@@ -834,19 +1365,26 @@ def _planned_long_was_completed(session: dict[str, Any], run: dict[str, Any]) ->
 
 def _has_recent_true_quality_before(
     reference_day: date,
+    reference_session: dict[str, Any],
     recent_runs: list[dict[str, Any]],
     *,
     max_age: int = 3,
 ) -> bool:
     for run in recent_runs:
         age = _run_age(reference_day, run)
-        if age is not None and 1 <= age <= max_age and _is_true_quality_run(run):
+        if age is None or not 1 <= age <= max_age:
+            continue
+        if reference_session.get("category") == "quality":
+            if _planned_quality_was_completed(reference_session, run):
+                return True
+        elif _is_true_quality_run(run):
             return True
     return False
 
 
 def _key_miss_block_reason(
     missed_day: date,
+    missed_session: dict[str, Any],
     missed_run: dict[str, Any] | None,
     recent_runs: list[dict[str, Any]],
 ) -> str | None:
@@ -854,7 +1392,7 @@ def _key_miss_block_reason(
     # normale 2-3 jours avant ne doit pas, elle, bloquer un seuil a recaler.
     if missed_run is not None and _is_hard_or_long_run(missed_run):
         return "alternate_load"
-    if _has_recent_true_quality_before(missed_day, recent_runs):
+    if _has_recent_true_quality_before(missed_day, missed_session, recent_runs):
         return "recent_quality"
     return None
 
@@ -950,19 +1488,20 @@ def _recent_context(recent_runs: list[dict[str, Any]], day: date) -> dict[str, A
 
 
 def _phase_for(day: date) -> str:
+    """Phase de periodisation d'un jour, deduite de sa position dans le bloc."""
     if day >= RACE_DAY:
         return "race"
-    if day >= RACE_DAY - timedelta(days=6):
-        return "race_week"
-    if day >= RACE_DAY - timedelta(days=20):
-        return "taper"
-    if day >= RACE_DAY - timedelta(days=34):
-        return "peak"
-    if day >= PLAN_START + timedelta(days=32):
-        return "specific"
-    if day >= PLAN_START + timedelta(days=4):
-        return "base"
-    return "reprise"
+    if day < PLAN_WEEK_ONE:
+        return "reprise"
+    week_num = (day - PLAN_WEEK_ONE).days // 7 + 1
+    if week_num > PLAN_SHAPE["planWeeks"]:
+        return "race"
+    return _phase_of_week(
+        week_num,
+        PLAN_SHAPE["buildWeeks"],
+        PLAN_SHAPE["baseWeeks"],
+        PLAN_SHAPE["planWeeks"],
+    )
 
 
 def _adaptive_easy(minutes: int = 45, *, strides: bool = False) -> dict[str, Any]:
@@ -982,46 +1521,82 @@ def _adaptive_steady(minutes: int = 60) -> dict[str, Any]:
 def _adaptive_quality(day: date, ctx: dict[str, Any], phase: str) -> dict[str, Any]:
     week_index = max(0, (day - PLAN_START).days // 7)
     if phase == "race_week":
-        return _quality_plan("Rappel allure marathon", "30' facile dont 3 x 1 km a 5:30/km, recup 2' facile", tag="marathon-pace")
+        return _quality_plan(
+            "Rappel allure marathon",
+            f"30' facile dont 3 x 1 km a {GOAL_PACE_TIGHT}, recup 2' facile",
+            tag="marathon-pace",
+        )
     if phase == "taper":
-        return _quality_plan("Allure marathon controlee", "3 x 2 km a 5:30/km, recup 1' trot", tag="marathon-pace")
+        return _quality_plan(
+            "Allure marathon controlee",
+            f"3 x 2 km a {GOAL_PACE_TIGHT}, recup 1' trot",
+            tag="marathon-pace",
+        )
     if phase in {"specific", "peak"}:
         if week_index % 2 == 0:
-            return _quality_plan("Bloc allure marathon", "2 x 5 km a 5:30/km, recup 2' trot", tag="marathon-pace")
-        return _quality_plan("Seuil controle", "3 x 10' a 4:18-4:28/km, recup 3' trot", tag="threshold")
+            return _quality_plan(
+                "Bloc allure marathon",
+                f"2 x 5 km a {GOAL_PACE_TIGHT}, recup 2' trot",
+                tag="marathon-pace",
+            )
+        return _quality_plan(
+            "Seuil controle", f"3 x 10' a {THRESHOLD_PACE}, recup 3' trot", tag="threshold"
+        )
     if week_index % 2 == 0:
-        return _quality_plan("Seuil progressif", "3 x 8' a 4:18-4:28/km, recup 2' trot", tag="threshold")
-    return _quality_plan("Rappel vitesse", "6 x 400 m a 3:55-4:08/km, recup 1'30 trot", tag="vo2")
+        return _quality_plan(
+            "Seuil progressif", f"3 x 8' a {THRESHOLD_PACE}, recup 2' trot", tag="threshold"
+        )
+    return _quality_plan(
+        "Rappel vitesse", f"6 x 400 m a {VO2_PACE}, recup 1'30 trot", tag="vo2"
+    )
 
 
 def _adaptive_long(ctx: dict[str, Any], phase: str) -> dict[str, Any]:
     longest = ctx["longest_recent_km"] or 0
+    start_km = PROFILE.long_start_km
+    peak_km = PROFILE.long_peak_km
     if phase == "reprise":
-        return _long_plan("Sortie longue facile", "60-70' facile, 12-13 km sans bloc rapide")
+        return _long_plan(
+            "Sortie longue facile", f"60-70' facile a {EASY_PACE}, sans bloc rapide"
+        )
     if phase == "base":
-        target = min(20, max(16, int(round(longest + 2)) if longest else 16))
-        # Blocs AM des la phase de base (base acquise, demande du 17 juil) :
-        # 4 km a 16 km, 6 a 18, 8 a 20.
-        block = max(4, min(8, target - 12))
-        return _long_plan(f"SL {target} km avec AM", f"{target} km dont les {block} derniers a 5:25-5:35/km")
+        target = min(start_km + 4, max(start_km, int(round(longest + 2)) if longest else start_km))
+        block = max(4, min(PROFILE.long_am_start_km + 2, target - 12))
+        return _long_plan(
+            f"SL {target} km avec AM", f"{target} km dont les {block} derniers a {GOAL_PACE}"
+        )
     if phase == "specific":
-        target = min(30, max(22, int(round(longest + 2)) if longest else 22))
+        floor_km = max(start_km, peak_km - 8)
+        target = min(peak_km, max(floor_km, int(round(longest + 2)) if longest else floor_km))
         if ctx["km_7"] >= 62:
-            target = max(20, target - 4)
-        am_block = "8-10 km" if target < 26 else "10-12 km"
-        return _long_plan(f"SL {target} km avec AM", f"{target} km dont {am_block} a 5:25-5:35/km")
+            target = max(start_km, target - 4)
+        am_block = max(6, min(PROFILE.long_am_peak_km, target - LONG_AM_WARMUP_KM))
+        return _long_plan(
+            f"SL {target} km avec AM", f"{target} km dont {am_block} km a {GOAL_PACE}"
+        )
     if phase == "peak":
         if ctx["last_long_age"] is None or ctx["last_long_age"] >= 7:
-            return _long_plan("SL pic marathon", "28-32 km avec 3 blocs de 5-6 km a 5:25-5:35/km")
-        return _long_plan("Semi test ou 21 km AM", "21 km dont 12 km a allure marathon, ou semi test controle")
+            blocks = max(2, PROFILE.long_am_peak_km // 6)
+            return _long_plan(
+                "SL pic marathon",
+                f"{peak_km - 2}-{peak_km + 2} km avec {blocks} blocs de 5-6 km a {GOAL_PACE}",
+            )
+        return _long_plan(
+            "Semi test ou 21 km AM",
+            f"21 km dont 12 km a {GOAL_PACE}, ou semi test controle a {SEMI_PACE}",
+        )
     if phase == "taper":
-        return _long_plan("Derniere SL allegee", "16-22 km facile, avec 5 km maximum a allure marathon si jambes fraiches")
+        return _long_plan(
+            "Derniere SL allegee",
+            f"{max(12, round(peak_km * 0.55))}-{round(peak_km * 0.7)} km facile, "
+            f"avec 5 km maximum a {GOAL_PACE} si les jambes sont fraiches",
+        )
     return _adaptive_easy(35)
 
 
 def _adaptive_schedule_for(day: date, recent_runs: list[dict[str, Any]]) -> dict[str, Any]:
     if day == RACE_DAY:
-        return _race(RACE_NAME)
+        return _race(PROFILE.race_name)
     if day > RACE_DAY:
         return _adaptive_recovery(30)
 
@@ -1040,7 +1615,7 @@ def _adaptive_schedule_for(day: date, recent_runs: list[dict[str, Any]]) -> dict
 
     missed_long = ctx["last_long_age"] is None or ctx["last_long_age"] > 10
     if missed_long and not fatigued and weekday == 5:
-        return _long_plan("Sortie longue reportee", "75-95' facile a 6:15-6:50/km, sans bloc rapide")
+        return _long_plan("Sortie longue reportee", "75-95' facile a 5:20-5:50/km, sans bloc rapide")
 
     if weekday == 0:
         if ctx["last_quality_age"] is None or ctx["last_quality_age"] >= 5:
@@ -1068,6 +1643,9 @@ def _adaptive_schedule_for(day: date, recent_runs: list[dict[str, Any]]) -> dict
 
 
 def _schedule_for(day: date, recent_runs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    override = _PLAN_OVERRIDES.get().get(day.isoformat())
+    if override is not None:
+        return deepcopy(override)
     planned = PLAN_CALENDAR.get(day.isoformat())
     if planned is not None:
         return deepcopy(planned)
@@ -1127,6 +1705,8 @@ def _advanced_session_from_run(
         "run_day": run_day,
         "target_day": target_day,
         "target_session": target_session,
+        # Dimanche de la semaine du run : borne de validite du decalage.
+        "week_end": run_day + timedelta(days=6 - run_day.weekday()),
     }
 
 
@@ -1136,6 +1716,191 @@ def _next_long_day(start: date, recent_runs: list[dict[str, Any]]) -> date | Non
         if _schedule_for(day, recent_runs).get("category") == "long":
             return day
     return None
+
+
+def _previous_long_day(day: date, recent_runs: list[dict[str, Any]]) -> date | None:
+    """Jour de la sortie longue planifiee juste avant `day`."""
+    for offset in range(1, 15):
+        candidate = day - timedelta(days=offset)
+        if _schedule_for(candidate, recent_runs).get("category") == "long":
+            return candidate
+    return None
+
+
+def _covers_long_in_advance(
+    long_day: date,
+    long_session: dict[str, Any],
+    run_day: date,
+    run: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> bool:
+    """Ce run couvre-t-il la SL planifiee le `long_day`, courue en avance ?
+
+    La fenetre n'est pas un simple nombre de jours : elle s'arrete a la SL
+    planifiee precedente, sinon la sortie longue de la semaine d'avant
+    annulerait celle qui vient.
+    """
+    if long_session.get("category") != "long":
+        return False
+    advance_days = (long_day - run_day).days
+    if not 1 <= advance_days <= LONG_ADVANCE_MAX_DAYS:
+        return False
+    previous_long = _previous_long_day(long_day, recent_runs)
+    if previous_long is not None and run_day <= previous_long:
+        return False
+    return _planned_long_was_completed(long_session, run)
+
+
+def _long_run_done_in_advance(
+    day: date,
+    session: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]] | None:
+    """Vraie SL deja courue en avance pour la sortie longue planifiee le `day`."""
+    if session.get("category") != "long":
+        return None
+    for age, run in _recent_context(recent_runs, day)["runs"]:
+        if _covers_long_in_advance(day, session, day - timedelta(days=age), run, recent_runs):
+            return age, run
+    return None
+
+
+def _key_absorbed_in_advance(
+    day: date,
+    session: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> bool:
+    """Cette seance cle a-t-elle deja ete absorbee par un run en avance ?
+
+    Une SL courue le vendredi pour le samedi n'est pas une seance MANQUEE : le
+    samedi est deja passe en recuperation via `_long_run_done_in_advance`. Sans
+    ce test, le lendemain voyait "seance cle manquee hier" et decalait une SL
+    allegee de 16 km 48 h apres une SL de 25 km. Le cas est tombe deux fois :
+    corrige a la main par un override coach le 16 aout 2026 (SL courue ven 14),
+    puis reapparu a l'identique le 23 (SL courue ven 21).
+
+    Le detour par la qualite n'est pas necessaire ici : une qualite courue en
+    avance est deja neutralisee par `_key_miss_block_reason` ("recent_quality").
+    """
+    if session.get("category") != "long":
+        return False
+    return _long_run_done_in_advance(day, session, recent_runs) is not None
+
+
+def _advanced_long_target(
+    run_day: date,
+    run: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> tuple[date, dict[str, Any]] | None:
+    """Prochaine sortie longue planifiee que ce run vient d'absorber en avance."""
+    for offset in range(1, LONG_ADVANCE_MAX_DAYS + 1):
+        target_day = run_day + timedelta(days=offset)
+        target_session = _schedule_for(target_day, recent_runs)
+        if target_session.get("category") != "long":
+            continue
+        if _covers_long_in_advance(target_day, target_session, run_day, run, recent_runs):
+            return target_day, target_session
+        # Ne pas regarder au-dela de la premiere SL rencontree : si ce run ne la
+        # couvre pas, il ne couvre pas non plus celle de la semaine suivante.
+        return None
+    return None
+
+
+def matched_session_for_run(
+    run: dict[str, Any],
+    recent_runs: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, date, int]:
+    """Seance couverte par un run : (seance, jour prevu, jours d'avance).
+
+    Une sortie longue courue le vendredi pour le samedi couvre la sortie longue,
+    pas le footing d'allegement de la veille. On reutilise les detecteurs d'avance
+    du plan pour que toutes les vues racontent la meme histoire.
+    """
+    try:
+        run_day = _parse_day(run.get("date") or (run.get("start_date_local") or "")[:10])
+    except (TypeError, ValueError):
+        return None, date.today(), 0
+    context = list(recent_runs or [])
+
+    long_target = _advanced_long_target(run_day, run, context)
+    if long_target is not None:
+        target_day, target_session = long_target
+        return target_session, target_day, (target_day - run_day).days
+
+    advanced = _advanced_session_from_run(run, context)
+    if advanced is not None:
+        return advanced["target_session"], advanced["target_day"], 1
+
+    base = _schedule_for(run_day, context)
+
+    # Filet de rattachement du run. Les detecteurs ci-dessus s'appuient sur les
+    # moyennes de la sortie : un "AM 5 x 2 km" echauffement et retour au calme
+    # inclus sort a 5:04/km, hors de la fenetre allure marathon, donc le plan ne
+    # le voit pas couvrir la seance du lendemain. Ce filet reconnait cette seance
+    # a un jour pres. Borne serree : rien de consistant prevu le jour du run,
+    # vraie qualite courue, qualite planifiee le lendemain.
+    if base.get("category") in {"rest", "easy"} and _is_true_quality_run(run):
+        next_day = run_day + timedelta(days=1)
+        next_session = _schedule_for(next_day, context)
+        if next_session.get("category") == "quality":
+            print(
+                f"[plan-session] run du {run_day} rattache a la qualite du "
+                f"{next_day} (courue 1 j en avance)",
+                file=sys.stderr,
+            )
+            return next_session, next_day, 1
+
+    return base, run_day, 0
+
+
+def _recovery_already_served_by_advanced_long(
+    day: date,
+    base_session: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> date | None:
+    """La recuperation de ce jour a-t-elle deja ete posee la veille ?
+
+    Le gabarit place la recuperation le lendemain de la sortie longue. Quand la
+    SL est courue en avance, le jour de SL prevu bascule lui-meme en
+    recuperation (`_long_run_done_in_advance`) : le lendemain, deja a J+2 de la
+    vraie SL, repetait mot pour mot la meme seance — deux « Footing de
+    recuperation · ~6 km · 38 min » d'affilee. Il redevient un footing facile,
+    ce qui rend aussi le volume que la veille de SL allegee avait coute.
+
+    Retourne le jour de la vraie SL, ou None si la regle ne s'applique pas.
+    """
+    if base_session.get("tag") != "recovery":
+        return None
+    if day.isoformat() in _PLAN_OVERRIDES.get():
+        # Un ajustement du coach prime sur l'adaptation automatique.
+        return None
+    previous = day - timedelta(days=1)
+    previous_session = _schedule_for(previous, recent_runs)
+    advance = _long_run_done_in_advance(previous, previous_session, recent_runs)
+    if advance is None:
+        return None
+    return previous - timedelta(days=advance[0])
+
+
+def _advanced_long_recovery_shift(
+    day: date,
+    base_session: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str] | None:
+    """Seance + note quand la recuperation d'apres-SL a deja ete servie la veille.
+
+    Partagee par le jour courant et l'apercu : les deux vues doivent raconter la
+    meme chose sur ce jour, sinon le coach et le dashboard divergent des que la
+    date change.
+    """
+    real_long_day = _recovery_already_served_by_advanced_long(day, base_session, recent_runs)
+    if real_long_day is None:
+        return None
+    return _adaptive_easy(45), (
+        f"Sortie longue courue le {_fmt_short_day(real_long_day.isoformat())} : la "
+        f"recuperation d'apres-SL tombe le {_fmt_short_day((day - timedelta(days=1)).isoformat())}. "
+        "Ce jour est deja a J+2, donc footing facile plutot qu'une deuxieme recuperation."
+    )
 
 
 def _active_advance_for_day(
@@ -1159,6 +1924,24 @@ def _active_advance_for_day(
             continue
         if next_long is not None and day >= next_long:
             continue
+        # Le decalage ne vaut que pour "le reste de la semaine" du run, comme le
+        # dit la note affichee. La borne "prochaine SL" ne suffit pas : quand un
+        # override coach annule les SL suivantes (week-end rando, montagne), la
+        # prochaine SL planifiee saute deux semaines plus loin et le decalage
+        # d'un jour survivait jusque-la. Un run du lun 27 juil decalait encore
+        # les 12-14 aout, alors que le coach matinal lisait la trame non
+        # decalee : c'est exactement le desaccord d'un jour entre les deux.
+        if day > advance["week_end"]:
+            if day == advance["week_end"] + timedelta(days=1):
+                # Une seule ligne par run candidat : ce helper est appele pour
+                # chaque jour du plan, un log par jour noierait backend.log.
+                print(
+                    f"[plan-advance] decalage du {advance['run_day']} borne au "
+                    f"{advance['week_end']} (fin de sa semaine) : il ne s'applique "
+                    f"plus a partir du {day}",
+                    file=sys.stderr,
+                )
+            continue
         candidates.append({**advance, "next_long_day": next_long})
 
     if not candidates:
@@ -1177,8 +1960,26 @@ def _advanced_shift_for_day(
         return None
 
     next_long = advance.get("next_long_day")
-    pulled_day = day + timedelta(days=1)
     advanced_title = _session_title(advance["target_session"])
+    if advance["target_session"].get("category") == "quality":
+        # Une qualite avancee echange sa place avec la seance legere qui la
+        # precedait. En S6, le lundi etait repos : le mardi devient donc repos.
+        # A partir de S7, le lundi porte un footing de volume : c'est ce footing
+        # qui passe au mardi. On conserve ainsi le volume et six sorties sans
+        # imposer un repos systematique apres chaque qualite avancee.
+        if day == advance["target_day"]:
+            replacement = _quality_advance_replacement(
+                advance["run_day"],
+                recent_runs,
+            )
+            return replacement, _quality_advance_adjustment(
+                advanced_title,
+                advance["run_day"],
+                replacement,
+            )
+        return None
+
+    pulled_day = day + timedelta(days=1)
     long_note = ""
     if next_long is not None:
         long_note = f" La prochaine SL ({_fmt_short_day(next_long.isoformat())}) reste a sa date."
@@ -1195,6 +1996,43 @@ def _advanced_shift_for_day(
         f"{advanced_title} courue avec 1 jour d'avance le "
         f"{_fmt_short_day(advance['run_day'].isoformat())} : j'avance le reste "
         f"de la semaine d'un jour jusqu'a la prochaine SL.{long_note}"
+    )
+
+
+def _quality_advance_replacement(
+    run_day: date,
+    recent_runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Seance de J a deplacer a J+1 quand la qualite de J+1 est courue a J.
+
+    Seuls un repos ou un footing vraiment leger se deplacent sans risque. Une
+    autre seance cle ou une endurance moyenne ne doit jamais etre empilee au
+    lendemain d'une qualite : dans ce cas, le repli prudent reste le repos.
+    """
+    displaced = _schedule_for(run_day, recent_runs)
+    if displaced.get("category") == "rest":
+        return _rest()
+    if displaced.get("category") == "easy" and displaced.get("tag") != "steady":
+        return deepcopy(displaced)
+    return _rest()
+
+
+def _quality_advance_adjustment(
+    advanced_title: str,
+    run_day: date,
+    replacement: dict[str, Any],
+) -> str:
+    run_label = _fmt_short_day(run_day.isoformat())
+    if replacement.get("category") == "rest":
+        swap = "le repos prevu la veille est deplace aujourd'hui"
+    else:
+        swap = (
+            f"la seance legere prevue la veille ({_session_title(replacement)}) "
+            "est deplacee aujourd'hui"
+        )
+    return (
+        f"{advanced_title} courue avec 1 jour d'avance le {run_label} : {swap}. "
+        "Le reste de la semaine ne bouge pas."
     )
 
 
@@ -1249,8 +2087,14 @@ def _reconcile_preview_with_reality(
             prev_run is not None
             and prev_session.get("category") in {"quality", "long"}
             and not _planned_key_was_completed(prev_session, prev_run)
+            and not _key_absorbed_in_advance(prev_day, prev_session, recent_runs)
         ):
-            block_reason = _key_miss_block_reason(prev_day, prev_run, recent_runs)
+            block_reason = _key_miss_block_reason(
+                prev_day,
+                prev_session,
+                prev_run,
+                recent_runs,
+            )
             if block_reason == "alternate_load":
                 return _adaptive_recovery(35), (
                     "Seance cle de la veille non couverte, mais l'effort reel etait "
@@ -1270,12 +2114,17 @@ def _reconcile_preview_with_reality(
 
     ctx = _recent_context(recent_runs, day)
     if category == "long":
-        # Regle du plan : une VRAIE SL courue avec 1-2 jours d'avance couvre la
-        # SL planifiee -> le jour initialement prevu devient recuperation. Un
-        # simple medium-long (13-15 km) ne compte pas comme la SL du plan.
-        if any(age <= 2 and _planned_long_was_completed(base_session, run) for age, run in ctx["runs"]):
+        # Regle du plan : une VRAIE SL courue en avance dans la semaine de plan
+        # couvre la SL planifiee -> le jour initialement prevu devient
+        # recuperation. Un simple medium-long (13-15 km) ne compte pas comme la
+        # SL du plan, et la SL de la semaine precedente est exclue par la borne.
+        advance = _long_run_done_in_advance(day, base_session, recent_runs)
+        if advance is not None:
+            advance_days = advance[0]
             return _adaptive_recovery(35), (
-                "Sortie longue deja courue en avance : le jour prevu passe en recuperation."
+                f"Sortie longue deja courue {_advance_label(advance_days)} "
+                f"({_fmt_short_day((day - timedelta(days=advance_days)).isoformat())}) : "
+                "le jour prevu passe en recuperation."
             )
         return None
     unplanned_hard_yesterday = any(
@@ -1283,8 +2132,21 @@ def _reconcile_preview_with_reality(
         for age, run in ctx["runs"]
     )
     if category == "quality":
-        quality_age = ctx["last_quality_age"]
-        if quality_age is not None and quality_age <= 3:
+        covering_quality = _recent_quality_covering_session(
+            base_session,
+            ctx["runs"],
+            max_age=3,
+        )
+        if covering_quality is not None:
+            quality_age = covering_quality[0]
+            if quality_age == 1:
+                run_day = day - timedelta(days=1)
+                replacement = _quality_advance_replacement(run_day, recent_runs)
+                return replacement, _quality_advance_adjustment(
+                    _session_title(base_session),
+                    run_day,
+                    replacement,
+                )
             note = (
                 f"Qualite deja faite il y a {quality_age} jour(s) : "
                 "je remplace la qualite prevue par du footing facile."
@@ -1299,7 +2161,80 @@ def _reconcile_preview_with_reality(
         return _adaptive_recovery(35), (
             "Effort non planifie la veille : la seance prevue bascule en footing de recuperation."
         )
+    recovery_shift = _advanced_long_recovery_shift(day, base_session, recent_runs)
+    if recovery_shift is not None:
+        return recovery_shift
     return None
+
+
+def _completed_day_adjustment(
+    day: date,
+    run: dict[str, Any],
+    base_session: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+    *,
+    same_day: bool = True,
+    plan_reference: tuple[dict[str, Any] | None, date, int] | None = None,
+) -> str:
+    """Note d'ajustement d'un jour deja couru.
+
+    Partagee par le cockpit et la page Plan : les deux vues doivent raconter la
+    meme chose sur un jour donne. `same_day` distingue le jour courant d'un jour
+    passe relu depuis la page Plan (le texte ne peut pas dire "aujourd'hui").
+    """
+    when = "aujourd'hui" if same_day else "ce jour-la"
+    matched_session, matched_day, advance_days = (
+        plan_reference or matched_session_for_run(run, recent_runs)
+    )
+    if matched_session is not None and advance_days > 0:
+        if matched_session.get("category") == "quality":
+            replacement = _quality_advance_replacement(day, recent_runs)
+            if replacement.get("category") == "rest":
+                swap = "Le repos prevu ce jour est deplace au lendemain."
+            else:
+                swap = (
+                    f"La seance legere prevue ce jour ({_session_title(replacement)}) "
+                    "est deplacee au lendemain."
+                )
+            return (
+                f"{_session_title(matched_session)} etait prevue le lendemain : "
+                f"elle est absorbee avec 1 jour d'avance. {swap} "
+                "Le reste de la semaine garde ses dates."
+            )
+        if matched_session.get("category") == "long":
+            target_label = _fmt_short_day(matched_day.isoformat())
+            return (
+                f"{_session_title(matched_session)} etait prevue {target_label} : elle est "
+                f"absorbee {_advance_label(advance_days)}. Le {target_label} "
+                "passe en recuperation, les jours d'ici la restent legers."
+            )
+        return (
+            f"{_session_title(matched_session)} etait prevue le lendemain : "
+            "elle est absorbee avec 1 jour d'avance. J'avance les prochains "
+            "jours d'un cran jusqu'a la prochaine SL, qui reste a sa date."
+        )
+    direction = _effort_vs_plan(run, base_session)
+    if base_session.get("kind") == "rest" and direction == "harder":
+        return (
+            f"Seance non prevue par le plan absorbee {when} : "
+            "pas de rattrapage, les prochains jours restent legers."
+        )
+    if direction == "lighter" and base_session.get("category") in {"quality", "long"}:
+        return (
+            f"Seance cle prevue non couverte {when} : pas de rattrapage empile, "
+            "je la decale en version allegee sur le prochain jour leger."
+        )
+    if direction == "harder":
+        return (
+            "La seance reelle est plus grosse que prevu : je m'aligne sur ce qui "
+            f"a ete couru, pas de second bloc {when}."
+        )
+    if direction == "lighter":
+        return (
+            f"Seance plus legere que prevu : pas de compensation {when}, "
+            "on garde le cap sur la prochaine seance cle."
+        )
+    return f"Seance deja faite {when} : pas de second bloc a ajouter."
 
 
 def build_daily_training_guidance(
@@ -1316,6 +2251,13 @@ def build_daily_training_guidance(
     base_session = _schedule_for(day, recent_runs)
     session = deepcopy(base_session)
     today_iso = day.isoformat()
+    # Un override coach explicite (table plan_overrides) doit primer sur TOUTE
+    # adaptation automatique. On le detecte ici : _schedule_for l'a deja renvoye
+    # comme base_session, mais sans ce marqueur les branches d'auto-adaptation
+    # (rescheduling de seance cle manquee, allegement) ecrasent l'override quand
+    # sa categorie est easy/rest. Cf. CLAUDE.md "un override du coach prime sur
+    # l'adaptation automatique".
+    coach_override = _PLAN_OVERRIDES.get().get(today_iso)
     yesterday_iso = (day - timedelta(days=1)).isoformat()
     sleep_flags = _latest_sleep_flags(latest_sleep, day)
     context = _recent_context(recent_runs, day)
@@ -1329,20 +2271,45 @@ def build_daily_training_guidance(
         day == as_of
         and had_yesterday_key
         and not _planned_key_was_completed(yesterday_session, yesterday_run)
+        and not _key_absorbed_in_advance(
+            day - timedelta(days=1), yesterday_session, recent_runs
+        )
         and not _is_taper(day)
     )
     missed_yesterday_block_reason = (
-        _key_miss_block_reason(day - timedelta(days=1), yesterday_run, recent_runs)
+        _key_miss_block_reason(
+            day - timedelta(days=1),
+            yesterday_session,
+            yesterday_run,
+            recent_runs,
+        )
         if missed_yesterday_key
         else None
     )
     yesterday_hard = bool(yesterday_run and _is_hard_or_long_run(yesterday_run))
     recent_long = context["last_long_age"] is not None and context["last_long_age"] <= 2
-    recent_sl = (
-        base_session.get("category") == "long"
-        and any(age <= 2 and _planned_long_was_completed(base_session, run) for age, run in context["runs"])
+    sl_advance = _long_run_done_in_advance(day, base_session, recent_runs)
+    recent_sl = sl_advance is not None
+    # Une vraie qualite pese sur le lendemain. A J+2, elle ne doit alleger la
+    # journee que si la veille a elle-meme ete chargeante : sinon le jour
+    # intermediaire a DEJA servi de recuperation et on allegerait deux fois pour
+    # la meme seance. Cas reel du 12 aout 2026 : seuil 5x6' le lundi 10, footing
+    # recup de 40' le mardi 11 (override coach), et le site rabotait quand meme
+    # le footing 55' + lignes du mercredi a 35-45' en allure de recuperation --
+    # alors que le coach matinal annoncait la seance pleine.
+    recent_true_quality = (
+        context["last_quality_age"] is not None
+        and (
+            context["last_quality_age"] <= 1
+            or (context["last_quality_age"] <= 2 and yesterday_hard)
+        )
     )
-    recent_true_quality = context["last_quality_age"] is not None and context["last_quality_age"] <= 2
+    covering_quality = (
+        _recent_quality_covering_session(base_session, context["runs"], max_age=2)
+        if base_session.get("category") == "quality"
+        else None
+    )
+    recent_covering_quality = covering_quality is not None
     elevated_easy_hr = context["elevated_easy_hr"]
     positive_trend = any(age <= 5 and _looks_progressive(run) for age, run in context["runs"])
 
@@ -1350,45 +2317,46 @@ def build_daily_training_guidance(
     adjustment = "Rien a changer."
     rescheduled_missed_key = False
     shifted_from_advance = None
+    # La recuperation d'apres-SL deja servie la veille valait pour l'apercu mais
+    # pas pour le jour courant : le meme dimanche changeait de seance en passant
+    # de "J+1 vu samedi" a "aujourd'hui". Une seule regle, les deux vues.
+    recovery_shift = None
     if apply_adjustments and not today_run:
         shifted_from_advance = _advanced_shift_for_day(day, recent_runs, as_of)
+        recovery_shift = _advanced_long_recovery_shift(day, base_session, recent_runs)
 
     if apply_adjustments and today_run and day <= as_of:
         status = "done"
-        session = _complete_today(today_run, base_session)
-        direction = _effort_vs_plan(today_run, base_session)
-        advanced = _advanced_session_from_run(today_run, recent_runs)
-        if advanced is not None:
-            adjustment = (
-                f"{_session_title(advanced['target_session'])} etait prevue demain : "
-                "elle est absorbee avec 1 jour d'avance. J'avance les prochains "
-                "jours d'un cran jusqu'a la prochaine SL, qui reste a sa date."
-            )
-        elif base_session.get("kind") == "rest" and direction == "harder":
-            adjustment = (
-                "Seance non prevue par le plan absorbee aujourd'hui : "
-                "pas de rattrapage, les prochains jours restent legers."
-            )
-        elif direction == "lighter" and base_session.get("category") in {"quality", "long"}:
-            adjustment = (
-                "Seance cle prevue non couverte aujourd'hui : pas de rattrapage empile, "
-                "je la decale en version allegee sur le prochain jour leger."
-            )
-        elif direction == "harder":
-            adjustment = (
-                "La seance reelle est plus grosse que prevu : je m'aligne sur ce qui "
-                "a ete couru, pas de second bloc aujourd'hui."
-            )
-        elif direction == "lighter":
-            adjustment = (
-                "Seance plus legere que prevu : pas de compensation aujourd'hui, "
-                "on garde le cap sur la prochaine seance cle."
-            )
-        else:
-            adjustment = "Seance deja faite aujourd'hui : pas de second bloc a ajouter."
+        plan_reference = matched_session_for_run(today_run, recent_runs)
+        completed_against = (
+            plan_reference[0]
+            if plan_reference[0] is not None and plan_reference[2] > 0
+            else base_session
+        )
+        session = _complete_today(
+            today_run,
+            completed_against,
+            force_matching=plan_reference[2] > 0,
+        )
+        adjustment = _completed_day_adjustment(
+            day,
+            today_run,
+            base_session,
+            recent_runs,
+            plan_reference=plan_reference,
+        )
+    elif apply_adjustments and coach_override is not None:
+        # Override coach explicite : priorite absolue, aucune auto-adaptation
+        # (missed-key, allegement, avance) ne doit le remplacer.
+        session = deepcopy(coach_override)
+        status = "rest" if session.get("kind") == "rest" else "scheduled"
+        adjustment = coach_override.get("overrideNote") or "Ajustement du coach applique."
     elif apply_adjustments and shifted_from_advance is not None:
         session, adjustment = shifted_from_advance
         status = "rest" if session.get("kind") == "rest" else "scheduled"
+    elif apply_adjustments and recovery_shift is not None:
+        session, adjustment = recovery_shift
+        status = "scheduled"
     elif apply_adjustments and missed_yesterday_key and missed_yesterday_block_reason == "alternate_load":
         status = "scheduled"
         session = _adaptive_recovery(35)
@@ -1400,20 +2368,37 @@ def build_daily_training_guidance(
         session = _reschedule_missed_key(_schedule_for(day - timedelta(days=1), recent_runs))
         rescheduled_missed_key = True
         adjustment = "Seance cle manquee hier : je la decale aujourd'hui en version allegee, sans empiler la charge."
+    elif (
+        apply_adjustments
+        and base_session.get("category") == "quality"
+        and covering_quality is not None
+        and covering_quality[0] == 1
+    ):
+        # La qualite du mardi faite lundi echange sa place avec le contenu du
+        # lundi : repos en S6, footing de volume a partir de S7.
+        run_day = day - timedelta(days=1)
+        session = _quality_advance_replacement(run_day, recent_runs)
+        status = "rest" if session.get("kind") == "rest" else "scheduled"
+        adjustment = _quality_advance_adjustment(
+            _session_title(base_session),
+            run_day,
+            session,
+        )
     elif apply_adjustments and (
         sleep_flags["poor"]
         or elevated_easy_hr
         or yesterday_hard
         or recent_long
-        or recent_true_quality
+        or recent_sl
+        or (recent_covering_quality if base_session.get("category") == "quality" else recent_true_quality)
     ):
         status = "scheduled"
         if base_session.get("category") == "quality":
             # Prepa marathon : une sortie longue recente (ou de la veille) ne doit
             # PAS faire sauter un seuil planifie. On ne deload la qualite que sur
             # un vrai signal de fatigue : sommeil bas, FC easy elevee, ou une
-            # VRAIE seance de qualite recente (last_quality_age exclut deja les SL).
-            if sleep_flags["poor"] or elevated_easy_hr or recent_true_quality:
+            # qualite recente de volume comparable (les SL sont deja exclues).
+            if sleep_flags["poor"] or elevated_easy_hr or recent_covering_quality:
                 session = _easy(40)
                 session["pace_range"] = RECOVERY_PACE
                 adjustment = "Recuperation encore limitee : je remplace la qualite par 40' facile pour privilegier la fraicheur."
@@ -1423,9 +2408,14 @@ def build_daily_training_guidance(
                 adjustment = "Sortie longue recente, mais la seance de qualite prevue reste : en prepa on ne l'annule pas pour une SL."
         else:
             genuine_fatigue = sleep_flags["poor"] or elevated_easy_hr
-            if base_session.get("category") == "long" and recent_sl:
+            if base_session.get("category") == "long" and sl_advance is not None:
+                advance_days, _advance_run = sl_advance
                 session = _adaptive_recovery(35)
-                adjustment = "Sortie longue deja courue en avance : le jour prevu passe en recuperation."
+                adjustment = (
+                    f"Sortie longue deja courue {_advance_label(advance_days)} "
+                    f"({_fmt_short_day((day - timedelta(days=advance_days)).isoformat())}) : "
+                    "le jour prevu passe en recuperation."
+                )
             elif base_session.get("category") == "long" and not genuine_fatigue:
                 # Prepa marathon : un run long/moyen recent ne doit pas faire
                 # sauter la sortie longue prevue. On la garde (sauf vraie fatigue
@@ -1470,7 +2460,13 @@ def build_daily_training_guidance(
     # Distance et temps global de la seance, ajoutes dans le titre pour voir
     # d'un coup d'oeil le volume des prochains jours.
     est_km, est_minutes = _estimate_effort(session)
-    title = _title_with_effort(rendered["title"], est_km, est_minutes)
+    # Les seances terminees gardent leur titre stable ; distance et duree sont
+    # exposees dans les champs dedies et dans la meta de la carte.
+    title = (
+        rendered["title"]
+        if status == "done"
+        else _title_with_effort(rendered["title"], est_km, est_minutes)
+    )
 
     return {
         "date": today_iso,
@@ -1481,6 +2477,11 @@ def build_daily_training_guidance(
         "status": status,
         "statusLabel": status_label,
         "title": title,
+        # Le kind distingue le marathon (kind "race", strategie et gels cables
+        # dessus) d'une course secondaire (kind "custom", categorie "race").
+        # Sans lui, un consommateur ne peut deduire le kind que de la categorie
+        # et sert le protocole marathon sur un 10 km.
+        "kind": session.get("kind"),
         "category": session.get("category"),
         "tag": session.get("tag"),
         "estimatedKm": est_km,
@@ -1542,6 +2543,11 @@ def build_three_day_training_guidance(
         default="",
     )
     current = sessions[0]
+    overview = build_plan_overview(anchor, recent_runs)
+    current_week = next(
+        (week for week in overview["weeks"] if week["start"] <= anchor.isoformat() <= week["end"]),
+        None,
+    )
     return {
         **current,
         "planSource": PLAN_SOURCE,
@@ -1552,6 +2558,18 @@ def build_three_day_training_guidance(
             "end": PLAN_END.isoformat(),
         },
         "dataThrough": data_through,
+        "currentWeek": (
+            {
+                key: current_week[key]
+                for key in (
+                    "index", "start", "end", "label", "phase", "phaseLabel",
+                    "estimatedKmMin", "estimatedKmMax", "plannedRunDaysMin",
+                    "plannedRunDaysMax",
+                )
+            }
+            if current_week
+            else None
+        ),
         "sessions": sessions,
     }
 
@@ -1560,29 +2578,46 @@ def build_three_day_training_guidance(
 # Chaque allure d'entrainement porte une cible FC exprimee en % de FC max :
 # le frontend convertit en bpm avec la FC max reelle des 90 derniers jours.
 
+# Les allures viennent du profil, les pourcentages de FC sont physiologiques :
+# aucune des deux moities n'est ecrite en dur ici.
+_PACE_USAGE = {
+    "recovery": "Lendemain de seance dure, fatigue, sommeil bas. Conversation complete sans effort.",
+    "easy": "Volume de base, aisance respiratoire totale. La grande majorite du kilometrage.",
+    "steady": "Consolidation aerobie. Soutenu, mais jamais dur.",
+    "marathon": f"Blocs specifiques et jour J. Cible d'entrainement {GOAL_PACE_TIGHT}.",
+    "semi": "Semi test ou blocs longs controles.",
+    "threshold": "Tempo et repetitions de 6-10 min. FC stable sur chaque bloc, pas de derive.",
+    "vo2": "Rappel vitesse, volume limite. La FC monte en fin de repetition seulement.",
+    "strides": "20'' relachees, recup 40'' trot : trop court pour que la FC soit un repere.",
+}
+
+_PACE_LABELS = {
+    "recovery": "Recuperation",
+    "easy": "Footing facile",
+    "steady": "Endurance moyenne",
+    "marathon": "Allure marathon (AM)",
+    "semi": "Allure semi",
+    "threshold": "Seuil",
+    "vo2": "VO2 / fractionne",
+    "strides": "Lignes droites",
+}
+
 PACE_REFS = [
-    {"key": "recovery", "label": "Recuperation", "pace": RECOVERY_PACE, "hrPct": [0.60, 0.70],
-     "usage": "Lendemain de seance dure, fatigue, sommeil bas. Conversation complete sans effort."},
-    {"key": "easy", "label": "Footing facile", "pace": EASY_PACE, "hrPct": [0.65, 0.75],
-     "usage": "Volume de base, aisance respiratoire totale. La grande majorite du kilometrage."},
-    {"key": "steady", "label": "Endurance moyenne", "pace": STEADY_PACE, "hrPct": [0.73, 0.80],
-     "usage": "Steady, consolidation aerobie. Soutenu mais jamais dur."},
-    {"key": "marathon", "label": "Allure marathon (AM)", "pace": GOAL_PACE, "hrPct": [0.80, 0.88],
-     "usage": "Blocs specifiques et jour J. Allure d'exemple a personnaliser."},
-    {"key": "semi", "label": "Allure semi", "pace": SEMI_PACE, "hrPct": [0.85, 0.90],
-     "usage": "Semi test (fin sept-debut oct) ou blocs longs controles."},
-    {"key": "threshold", "label": "Seuil", "pace": THRESHOLD_PACE, "hrPct": [0.88, 0.92],
-     "usage": "Tempo et repetitions de 6-10 min. FC stable sur chaque bloc, pas de derive."},
-    {"key": "vo2", "label": "VO2 / fractionne", "pace": VO2_PACE, "hrPct": [0.92, 0.97],
-     "usage": "Rappel vitesse, volume limite. La FC monte en fin de repetition seulement."},
-    {"key": "strides", "label": "Lignes droites", "pace": STRIDES_PACE, "hrPct": None,
-     "usage": "20'' relachees, recup 40'' trot : trop court pour que la FC soit un repere."},
+    {
+        "key": key,
+        "label": _PACE_LABELS[key],
+        "pace": PROFILE.pace(key),
+        "hrPct": list(PACE_TARGETS[key]) if PACE_TARGETS.get(key) else None,
+        "usage": _PACE_USAGE[key],
+    }
+    for key in _PACE_LABELS
 ]
 
 PHASE_LABELS = {
     "reprise": "Reprise fonciere",
     "base": "Base + premiers blocs AM",
     "specific": "Specifique marathon",
+    "deload": "Decharge",
     "peak": "Pic + semi test",
     "taper": "Affutage",
     "race_week": "Semaine de course",
@@ -1604,36 +2639,6 @@ def _is_workout_export_eligible(session: dict[str, Any]) -> bool:
     if session.get("category") == "long":
         return True
     return session.get("category") == "quality" and session.get("tag") in WORKOUT_EXPORT_QUALITY_TAGS
-
-FUEL_STRATEGY = {
-    "title": "Gels et glucides — exemple de strategie",
-    "diagnosis": (
-        "Tester progressivement la strategie de ravitaillement pendant les sorties longues. "
-        "La tolerance digestive varie selon les personnes et doit etre validee avant la course."
-    ),
-    "raceTarget": "60 g de glucides/h minimum le jour J (viser 70-80 g/h si l'intestin suit).",
-    "rules": [
-        "Lire la ligne glucides de l'etiquette, pas le poids du sachet : un gel de 30-40 g n'apporte souvent que 20-25 g de glucides.",
-        "60 g/h = 2 a 3 gels par heure (Maurten 100 = 25 g, SIS Go = ~22 g, Decathlon/Overstim's = 20-27 g).",
-        "SL < 20 km : 30-40 g/h pour habituer l'intestin. SL >= 20 km : monter vers 60 g/h.",
-        "Les 4-5 dernieres SL avant la course a 60 g/h ou plus, exactement comme le jour J.",
-        "1er gel tot (30-45 min), puis un toutes les 25-30 min, sans attendre la faim.",
-        "Toujours avec de l'eau, jamais sec ni avec une boisson sucree (bolus trop concentre = troubles intestinaux).",
-        "Privilegier les formules glucose + fructose (2:1 ou 1:0.8) : meilleure absorption, indispensable au-dela de 60 g/h.",
-        "Si les gels passent mal : alterner boisson d'effort ou pates de fruits. C'est le debit de glucides qui compte, pas le format.",
-    ],
-}
-
-RACE_STRATEGY = [
-    {"segment": "Km 1-5", "pace": "allure cible + 10-15 s/km", "hrPct": [0.76, 0.82],
-     "detail": "Depart controle : conserver de la marge et laisser la frequence cardiaque monter progressivement."},
-    {"segment": "Km 5-30", "pace": GOAL_PACE, "hrPct": [0.82, 0.88],
-     "detail": "Installer l'allure validee a l'entrainement sans depasser la zone cardiaque cible."},
-    {"segment": "Apres km 30", "pace": "tenir, puis accelerer si possible", "hrPct": [0.86, 0.92],
-     "detail": "Tenir posture et cadence. Accelerer legerement seulement si les sensations le permettent."},
-    {"segment": "Passage semi", "pace": "selon l'objectif configure", "hrPct": None,
-     "detail": "Rien de nouveau le jour J : meme ravitaillement, meme timing et meme petit-dejeuner qu'a l'entrainement."},
-]
 
 
 def _hr_ref(key: str) -> dict[str, Any] | None:
@@ -1709,15 +2714,15 @@ def _session_text(session: dict[str, Any]) -> str:
 
 def _has_am_block(session: dict[str, Any]) -> bool:
     text = _session_text(session)
-    return (
-        session.get("tag") == "marathon-pace"
-        or "allure marathon" in text.lower()
-        or " AM" in f" {text}"
-    )
+    return bool(re.search(r"4:3[57]", text)) or " AM" in f" {text}"
 
 
 def _estimate_effort(session: dict[str, Any]) -> tuple[float | None, int | None]:
     """Retourne (km estimes, minutes estimees) pour l'affichage et le timing des gels."""
+    actual_km = _coerce_float(session.get("actualDistanceKm"))
+    actual_minutes = _coerce_float(session.get("actualMinutes"))
+    if actual_km is not None:
+        return round(actual_km, 1), int(round(actual_minutes)) if actual_minutes else None
     kind = session.get("kind")
     category = session.get("category")
     if kind == "rest":
@@ -1739,6 +2744,18 @@ def _estimate_effort(session: dict[str, Any]) -> tuple[float | None, int | None]
         return None, None
     if kind == "custom":
         main = session.get("main", "")
+        if category == "race":
+            # Un dossard, c'est l'echauffement + la course + le retour au calme.
+            # Sans ce cadre, la page Plan ne compterait que la distance
+            # officielle et sous-estimerait la semaine de plusieurs kilometres.
+            race_km = _parse_first_km(main)
+            race_minutes = _parse_main_minutes(main)
+            around = RACE_WARMUP_MINUTES + RACE_COOLDOWN_MINUTES
+            if race_km:
+                return (
+                    round(race_km + around / 5.5, 1),
+                    (race_minutes + around) if race_minutes else None,
+                )
         if category == "quality":
             # Echauffement 12' + retour au calme 5' autour du corps de seance.
             # Si le corps de seance annonce une duree totale ("75-85' dont ..."),
@@ -1746,7 +2763,7 @@ def _estimate_effort(session: dict[str, Any]) -> tuple[float | None, int | None]
             head = main.split(" x ", 1)[0] if " x " in main else ""
             lead_total = _parse_main_minutes(head) if head else None
             if lead_total and lead_total >= 30:
-                return None, lead_total
+                return round(lead_total / 5.0, 1), lead_total
             reps_time = re.search(r"(\d+)\s*x\s*(\d+)\s*'", main)
             reps_km = re.search(r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*km\b", main)
             reps_dist = re.search(r"(\d+)\s*x\s*(\d+)\s*m\b", main)
@@ -1762,7 +2779,12 @@ def _estimate_effort(session: dict[str, Any]) -> tuple[float | None, int | None]
             else:
                 parsed = _parse_main_minutes(main)
                 work = parsed if parsed and parsed >= 15 else None
-            return None, (work + 17) if work else None
+            total = (work + 17) if work else None
+            # Les seances de qualite etaient les seules a renvoyer des minutes
+            # mais aucun kilometre : le total de la page Plan les oubliait donc
+            # entierement. 5:00/km est une estimation volontairement lisible du
+            # mix echauffement + travail + recuperations + retour au calme.
+            return (round(total / 5.0, 1), total) if total else (None, None)
         minutes = _parse_main_minutes(main)
         if minutes is None or minutes < 15:
             return None, None
@@ -1770,72 +2792,12 @@ def _estimate_effort(session: dict[str, Any]) -> tuple[float | None, int | None]
     return None, None
 
 
-def _fuel_plan(session: dict[str, Any], km: float | None, minutes: int | None) -> dict[str, Any] | None:
-    kind = session.get("kind")
-    category = session.get("category")
-
-    if kind == "race":
-        gels = []
-        for i, race_km in enumerate([5, 10, 15, 20, 25, 30, 35], start=1):
-            note = "gel cafeine possible" if race_km in {25, 30} else ""
-            gels.append({
-                "label": f"Gel {i}",
-                "at": f"km {race_km}",
-                "clock": _fmt_clock(int(round(race_km * 4.8))),
-                "note": note,
-            })
-        return {
-            "carbTarget": "60 g/h minimum (70-80 g/h si l'intestin suit)",
-            "before": "Petit-dejeuner rode a l'entrainement 3h avant + 1 gel 15 min avant le depart.",
-            "gels": gels,
-            "notes": [
-                "Un gel toutes les 25-30 min des le km 5, sans attendre la faim : au km 30 il est trop tard.",
-                "Toujours avec de l'eau aux ravitaillements, jamais sec.",
-                "Complement possible : boisson d'effort aux ravitos pour atteindre 60-70 g/h.",
-                "Total attendu : 9-11 gels en comptant celui du depart — panaches gels + boisson.",
-            ],
-        }
-
-    if category != "long" or not minutes or minutes < 65:
-        return None
-
-    is_race_like = bool(km and km >= 20)
-    interval = 25 if is_race_like else 30
-    first_gel = 40
-    last_useful = minutes - 20
-    gels = []
-    minute = first_gel
-    index = 1
-    while minute <= last_useful:
-        entry = {
-            "label": f"Gel {index}",
-            "at": _fmt_clock(minute),
-            "clock": _fmt_clock(minute),
-        }
-        if km and minutes:
-            entry["kmApprox"] = round(km * minute / minutes)
-            entry["at"] = f"{_fmt_clock(minute)} (~km {entry['kmApprox']})"
-        gels.append(entry)
-        minute += interval
-        index += 1
-
-    if not gels:
-        return None
-
-    if is_race_like:
-        carb_target = "60 g/h — repetition du protocole course"
-        notes = [
-            "SL >= 20 km : meme debit de glucides que le jour J (2-3 gels/h + eau).",
-            "Memes gels que ceux prevus pour le marathon : on rode l'intestin ET le produit.",
-            "Toujours avec de l'eau, jamais sec.",
-        ]
-    else:
-        carb_target = "30-40 g/h — entrainement digestif"
-        notes = [
-            "Objectif : habituer l'intestin, pas la performance. 1er gel tot, sans attendre la faim.",
-            "Toujours avec de l'eau, jamais sec.",
-        ]
-    return {"carbTarget": carb_target, "before": None, "gels": gels, "notes": notes}
+def _is_optional_session(session: dict[str, Any]) -> bool:
+    """Vrai quand la seance peut explicitement etre remplacee par du repos."""
+    if session.get("category") == "rest" or session.get("kind") == "rest":
+        return False
+    text = _session_text(session).lower()
+    return "ou repos" in text or "repos ou" in text
 
 
 def _session_paces_hr(session: dict[str, Any]) -> tuple[list[dict], list[dict]]:
@@ -1863,15 +2825,20 @@ def _session_paces_hr(session: dict[str, Any]) -> tuple[list[dict], list[dict]]:
         return paces, hr
 
     if kind == "race":
-        for seg in RACE_STRATEGY[:3]:
-            paces.append(_pace_chip(seg["segment"], seg["pace"]))
-            if seg.get("hrPct"):
-                hr.append({
-                    "label": seg["segment"],
-                    "pctMin": seg["hrPct"][0],
-                    "pctMax": seg["hrPct"][1],
-                    "note": "",
-                })
+        # Segments derives de la seule allure objectif : depart freine de 8 s/km,
+        # allure cible sur le corps de course, puis tenir. Rien de propre a une
+        # course ou a un coureur donne.
+        goal = PROFILE.goal_pace
+        paces.append(_pace_chip("Premiers kilometres", f"{_fmt_pace(goal + 8)}/km",
+                                "se sentir freine : c'est le seul depart qui ne coute rien"))
+        paces.append(_pace_chip("Corps de course", GOAL_PACE, f"cible {PROFILE.goal_label}"))
+        paces.append(_pace_chip("Dernier tiers", "tenir, accelerer si possible",
+                                "posture et cadence avant tout"))
+        for label, key in (("Premiers kilometres", "steady"), ("Corps de course", "marathon"),
+                           ("Dernier tiers", "threshold")):
+            target = _hr_target(key, label)
+            if target:
+                hr.append(target)
         return paces, hr
 
     if tag == "recovery":
@@ -1885,8 +2852,22 @@ def _session_paces_hr(session: dict[str, Any]) -> tuple[list[dict], list[dict]]:
         add_strides_if_any()
         return paces, hr
 
+    if tag == "race-10k":
+        pace_10k = PROFILE.goal_pace * (10 / 42.195) ** 0.06
+        paces.append(_pace_chip("Km 1-2", f"{_fmt_pace(pace_10k + 4)}/km",
+                                "le seul vrai risque du jour est de partir trop vite"))
+        paces.append(_pace_chip("Km 3-8", f"{_fmt_pace(pace_10k - 2)}-{_fmt_pace(pace_10k + 2)}/km",
+                                "monter en allure km apres km, sans a-coup"))
+        paces.append(_pace_chip("Km 9-10", "tout donner", "la seule portion ou l'on va se faire mal"))
+        hr.append(_hr_target("threshold", "Premiers kilometres", "FC deja au-dessus au km 2 : l'allure est trop rapide, ralentir tout de suite."))
+        hr.append(_hr_target("vo2", "Fin de course", "Zone atteinte seulement sur la fin : normal sur un 10 km, pas avant."))
+        return paces, [h for h in hr if h]
+
     if tag == "race-test":
-        paces.append(_pace_chip("Semi test", SEMI_PACE, "effort controle pour valider la cible marathon"))
+        paces.append(_pace_chip(
+            "Semi test", SEMI_PACE,
+            f"viser {fmt_clock(PROFILE.projected('semi'))} — c'est ce chrono qui decide la cible marathon",
+        ))
         hr.append(_hr_target("semi", "Semi test", "FC de course controlee : c'est un test, pas une course a bloc."))
         return paces, hr
 
@@ -1901,14 +2882,14 @@ def _session_paces_hr(session: dict[str, Any]) -> tuple[list[dict], list[dict]]:
             paces.append(_pace_chip("Recuperation entre blocs", "trot facile", ""))
             hr.append(_hr_target("threshold", "Pendant les blocs", "FC stable sur chaque bloc : si elle derive, l'allure est trop rapide."))
         elif tag == "marathon-pace":
-            paces.append(_pace_chip("Blocs allure marathon", GOAL_PACE, "allure d'exemple a personnaliser"))
-            hr.append(_hr_target("marathon", "Pendant les blocs AM", "Memoriser la FC a l'allure cible pour calibrer le jour J."))
+            paces.append(_pace_chip("Blocs allure marathon", GOAL_PACE, f"cible {GOAL_PACE_TIGHT}, au metronome"))
+            hr.append(_hr_target("marathon", "Pendant les blocs AM", f"C'est LA donnee a surveiller : memoriser la FC a {GOAL_PACE_TIGHT} pour le jour J."))
         elif tag == "tempo":
             paces.append(_pace_chip("Tempo", "4:30/km", "entre seuil et allure marathon"))
             hr.append(_hr_target("semi", "Tempo", "Controle : sous la FC de seuil."))
         else:
             paces.append(_pace_chip("Corps de seance", session.get("pace_range", THRESHOLD_PACE)))
-        paces.append(_pace_chip("Echauffement / retour au calme", "6:35-7:05/km", "tres facile"))
+        paces.append(_pace_chip("Echauffement / retour au calme", RECOVERY_PACE, "tres facile"))
         hr_easy = _hr_target("easy", "Echauffement / retour au calme", "")
         if hr_easy:
             hr.append(hr_easy)
@@ -1916,17 +2897,17 @@ def _session_paces_hr(session: dict[str, Any]) -> tuple[list[dict], list[dict]]:
 
     if category == "long":
         if _has_am_block(session):
-            paces.append(_pace_chip("Partie facile", "6:15-6:50/km", "aisance totale, on economise pour le bloc"))
-            paces.append(_pace_chip("Bloc allure marathon", GOAL_PACE, "allure d'exemple a personnaliser"))
+            paces.append(_pace_chip("Partie facile", "5:20-5:50/km", "aisance totale, on economise pour le bloc"))
+            paces.append(_pace_chip("Bloc allure marathon", GOAL_PACE, f"cible {GOAL_PACE_TIGHT}"))
             hr.append(_hr_target("easy", "Partie facile", "Rester bas : le bloc AM doit demarrer frais."))
             hr.append(_hr_target("marathon", "Bloc AM", "Noter la FC moyenne du bloc : c'est la reference jour J."))
         else:
-            paces.append(_pace_chip("Sortie longue facile", "6:15-6:50/km", "volume, pas d'intensite"))
+            paces.append(_pace_chip("Sortie longue facile", "5:20-5:50/km", "volume, pas d'intensite"))
             hr.append(_hr_target("easy", "Toute la sortie", "Derive FC en fin de sortie normale si elle reste sous ~80%."))
         return [p for p in paces if p], [h for h in hr if h]
 
     # Footing facile par defaut
-    paces.append(_pace_chip("Footing facile", "6:15-6:45/km", "aisance respiratoire totale"))
+    paces.append(_pace_chip("Footing facile", EASY_PACE, "aisance respiratoire totale"))
     hr.append(_hr_target("easy", "Footing", "Pouvoir parler en phrases completes tout du long."))
     add_strides_if_any()
     return [p for p in paces if p], [h for h in hr if h]
@@ -1944,6 +2925,7 @@ def _session_details(session: dict[str, Any]) -> dict[str, Any]:
         "categoryLabel": CATEGORY_LABELS.get(category, category),
         "tag": session.get("tag"),
         "keySession": category in {"quality", "long", "race"},
+        "optional": _is_optional_session(session),
         # Seules les SL et seances structurees utiles sur montre sont envoyables
         # vers Garmin Connect : pas les footings, pas l'endurance moyenne.
         "workoutEligible": _is_workout_export_eligible(session),
@@ -1954,7 +2936,6 @@ def _session_details(session: dict[str, Any]) -> dict[str, Any]:
         },
         "paces": paces,
         "hr": hr,
-        "fuel": _fuel_plan(session, km, minutes),
         "estimatedKm": km,
         "estimatedMinutes": minutes,
         "estimatedDuration": _fmt_clock(minutes) if minutes else None,
@@ -1989,38 +2970,126 @@ def build_workout_export(day: str | date | datetime | None) -> dict[str, Any] | 
     }
 
 
-def build_plan_overview(target_day: str | date | datetime | None = None) -> dict[str, Any]:
+def _plan_overview_day(
+    day: date,
+    planned: dict[str, Any],
+    recent_runs: list[dict[str, Any]],
+    today: date,
+) -> tuple[dict[str, Any], str | None]:
+    """Seance a afficher sur la page Plan + note d'ajustement eventuelle.
+
+    Le calendrier reste la reference, mais les runs reellement enregistres
+    priment : sans ca la page Plan continue d'annoncer une sortie longue deja
+    courue quelques jours plus tot.
+    """
+    if not recent_runs:
+        return planned, None
+
+    run = next((r for r in recent_runs if r.get("date") == day.isoformat()), None)
+    if run is not None and day <= today:
+        plan_reference = matched_session_for_run(run, recent_runs)
+        completed_against = (
+            plan_reference[0]
+            if plan_reference[0] is not None and plan_reference[2] > 0
+            else planned
+        )
+        return (
+            _complete_today(
+                run,
+                completed_against,
+                force_matching=plan_reference[2] > 0,
+            ),
+            _completed_day_adjustment(
+                day,
+                run,
+                planned,
+                recent_runs,
+                same_day=day == today,
+                plan_reference=plan_reference,
+            ),
+        )
+    # Les jours passes sans run doivent eux aussi etre reconciles. Sinon une SL
+    # courue le vendredi restait comptee une seconde fois le samedi sur la page
+    # Plan, des que l'on consultait la semaine apres coup.
+    reconcile_as_of = today if day > today else day
+    reconciled = _reconcile_preview_with_reality(day, planned, recent_runs, reconcile_as_of)
+    if reconciled is not None:
+        return reconciled
+    return planned, None
+
+
+def build_plan_overview(
+    target_day: str | date | datetime | None = None,
+    recent_runs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Plan complet, semaine par semaine, avec le detail de chaque seance."""
     today = _parse_day(target_day)
+    recent_runs = list(recent_runs or [])
+    overrides = _PLAN_OVERRIDES.get()
+    plan_days = sorted(set(PLAN_CALENDAR) | set(overrides))
     weeks_map: dict[date, list[tuple[date, dict[str, Any]]]] = {}
-    for iso in sorted(PLAN_CALENDAR):
+    for iso in plan_days:
         day = date.fromisoformat(iso)
         monday = day - timedelta(days=day.weekday())
-        weeks_map.setdefault(monday, []).append((day, PLAN_CALENDAR[iso]))
+        weeks_map.setdefault(monday, []).append((day, _schedule_for(day, recent_runs)))
 
     weeks = []
-    for index, monday in enumerate(sorted(weeks_map), start=1):
+    for monday in sorted(weeks_map):
         sunday = monday + timedelta(days=6)
+        # Meme numerotation que le coach : la reprise n'est pas "Semaine 1".
+        index = (monday - PLAN_WEEK_ONE).days // 7 + 1
         sessions = []
-        for day, session in weeks_map[monday]:
+        for day, planned in weeks_map[monday]:
+            session, adjustment = _plan_overview_day(day, planned, recent_runs, today)
             details = _session_details(session)
             sessions.append({
                 "date": day.isoformat(),
                 "dayLabel": _fmt_short_day(day.isoformat()),
                 "isToday": day == today,
                 "isPast": day < today,
+                "adjustment": adjustment,
+                "adjusted": adjustment is not None,
+                "plannedTitle": _session_title(planned) if adjustment else None,
+                "coachOverride": day.isoformat() in overrides,
+                "coachNote": planned.get("overrideNote"),
                 **details,
             })
-        phase = _phase_for(sunday if sunday < RACE_DAY else monday)
-        km_total = sum(s["estimatedKm"] or 0 for s in sessions)
+        week_num = (monday - PLAN_WEEK_ONE).days // 7 + 1
+        phase = (
+            "deload"
+            if week_num in PLAN_SHAPE["deloads"]
+            else _phase_for(sunday if sunday < RACE_DAY else monday)
+        )
+        km_max = sum(s["estimatedKm"] or 0 for s in sessions)
+        km_min = sum(
+            s["estimatedKm"] or 0
+            for s in sessions
+            if not s["optional"]
+        )
+        run_days_max = sum(s["category"] != "rest" for s in sessions)
+        run_days_min = sum(
+            s["category"] != "rest" and not s["optional"]
+            for s in sessions
+        )
         weeks.append({
             "index": index,
             "start": monday.isoformat(),
             "end": sunday.isoformat(),
-            "label": f"Semaine {index} — du {_fmt_short_day(monday.isoformat())} au {_fmt_short_day(sunday.isoformat())}",
+            "label": (
+                f"{'Semaine ' + str(index) if index >= 1 else 'Reprise'}"
+                f" — du {_fmt_short_day(monday.isoformat())}"
+                f" au {_fmt_short_day(sunday.isoformat())}"
+            ),
             "phase": phase,
             "phaseLabel": PHASE_LABELS.get(phase, phase),
-            "estimatedKm": int(round(km_total)),
+            # estimatedKm reste le maximum pour compatibilite API. Les deux
+            # bornes permettent a l'UI de ne plus presenter un "ou repos" comme
+            # un kilometrage obligatoire.
+            "estimatedKm": int(km_max + 0.5),
+            "estimatedKmMin": int(km_min + 0.5),
+            "estimatedKmMax": int(km_max + 0.5),
+            "plannedRunDaysMin": run_days_min,
+            "plannedRunDaysMax": run_days_max,
             "isCurrent": monday <= today <= sunday,
             "isPast": sunday < today,
             "sessions": sessions,
@@ -2035,7 +3104,5 @@ def build_plan_overview(target_day: str | date | datetime | None = None) -> dict
         "taperStart": TAPER_START.isoformat(),
         "daysToRace": max(0, (RACE_DAY - today).days),
         "paceRefs": PACE_REFS,
-        "raceStrategy": RACE_STRATEGY,
-        "fuelStrategy": FUEL_STRATEGY,
         "weeks": weeks,
     }

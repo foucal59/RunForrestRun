@@ -299,7 +299,7 @@ export default function Performance() {
           <div className="flex items-start justify-between gap-3 mb-4 performance_projections_header" data-name="performance_projections_header">
             <div>
               <h3 className="text-sm font-medium text-txt-secondary performance_projections_title" data-name="performance_projections_title">Projections Riegel</h3>
-              <p className="text-xs text-txt-muted mt-1 performance_projections_subtitle" data-name="performance_projections_subtitle">10 km, semi et marathon depuis le meilleur effort récent (90 j) — semi &gt; 10 km &gt; marathon &gt; 5 km.</p>
+              <p className="text-xs text-txt-muted mt-1 performance_projections_subtitle" data-name="performance_projections_subtitle">10 km, semi et marathon depuis le meilleur effort récent (90 j) — celui de plus grande valeur (indice Riegel), pas le plus long : un semi issu d&rsquo;une sortie longue ne dicte pas la projection 10 km.</p>
             </div>
             <div className={`text-[10px] px-2 py-1 rounded-lg font-medium performance_projection_confidence performance_projection_confidence_${projData.confidence}`} data-name="performance_projection_confidence">
               {projData.volume_90d_km} km / 90j
